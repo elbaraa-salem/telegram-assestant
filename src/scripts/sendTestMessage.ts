@@ -3,9 +3,11 @@ import input from "input";
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 
+// Manual test script only. Do not import this from production services.
+
 const apiId = Number(process.env.TG_API_ID);
 const apiHash = process.env.TG_API_HASH;
-const phoneNumber = process.env.TG_PHONE;
+const phoneNumber = process.env.TG_PHONE ?? "";
 const sessionString = process.env.TG_SESSION ?? "";
 
 if (!apiId || !apiHash || !phoneNumber) {

@@ -1,10 +1,13 @@
 {
   "name": "telegram-assestant",
   "version": "1.0.0",
-  "type": "commonjs",
+  "type": "module",
   "description": "",
   "scripts": {
-    "schedule": "tsx src/scheduleMessage.ts"
+    "typecheck": "tsc --noEmit",
+    "send:test": "tsx src/scripts/sendTestMessage.ts",
+    "sync:telegram-ids": "tsx src/scripts/syncTelegramIds.ts",
+    "sync:calendar": "tsx src/services/calendarSync.ts"
   },
   "keywords": [],
   "author": "",
@@ -18,6 +21,7 @@
     "telegram": "^2.26.22"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.8.0",
     "tsx": "^4.22.0",
     "typescript": "^6.0.3"

@@ -1,5 +1,6 @@
 import fs from "fs";
-import path from "path";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { google, calendar_v3 } from "googleapis";
 import { db } from "../database/db";
 
@@ -106,7 +107,7 @@ async function listUpcomingEvents(
   return events;
 }
 
-export async function syncUpcomingCalendarLessons(): Promise<SyncResult> {
+export async function syncCalendarLessons(): Promise<SyncResult> {
   const calendar = createCalendarClient();
   const students = db
     .prepare(
@@ -256,13 +257,20 @@ export async function syncUpcomingCalendarLessons(): Promise<SyncResult> {
 }
 
 async function main() {
-  const result = await syncUpcomingCalendarLessons();
-  console.log(result);
+  try {
+    const result = await syncCalendarLessons();
+    console.log("Calendar sync completed:");
+    console.log(result);
+  } catch (error) {
+    console.error("Calendar sync failed:");
+    console.error(error);
+    process.exit(1);
+  }
 }
 
-if (require.main === module) {
-  main().catch((error) => {
-    console.error("Calendar sync failed:", error);
-    process.exit(1);
-  });
+const currentFilePath = fileURLToPath(import.meta.url);
+const executedFilePath = process.argv[1] ? path.resolve(process.argv[1]) : "";
+
+if (currentFilePath === executedFilePath) {
+  void main();
 }
