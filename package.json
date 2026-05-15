@@ -6,6 +6,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "send:test": "tsx src/scripts/sendTestMessage.ts",
+    "send:reminders": "tsx src/services/reminderService.ts",
     "sync:telegram-ids": "tsx src/scripts/syncTelegramIds.ts",
     "sync:calendar": "tsx src/services/calendarSync.ts"
   },
