@@ -40,6 +40,8 @@ db.exec(`
 
     status TEXT NOT NULL DEFAULT 'scheduled',
     google_status TEXT,
+    student_response TEXT,
+    student_response_at TEXT,
 
     reminder_sent INTEGER NOT NULL DEFAULT 0,
     payment_request_sent INTEGER NOT NULL DEFAULT 0,
@@ -126,3 +128,21 @@ db.exec(`
     FOREIGN KEY (student_id) REFERENCES students(id)
   );
 `);
+
+function addColumnIfMissing(sql: string): void {
+  try {
+    db.exec(sql);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.includes("duplicate column name")
+    ) {
+      return;
+    }
+
+    throw error;
+  }
+}
+
+addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response TEXT");
+addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response_at TEXT");
