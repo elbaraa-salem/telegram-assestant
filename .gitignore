@@ -1,0 +1,8 @@
+node_modules
+dist
+.env
+google-token.json
+google-credentials.json
+*.session
+data/*.db
+data/*.db-journal

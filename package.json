@@ -1,0 +1,25 @@
+{
+  "name": "telegram-assestant",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "description": "",
+  "scripts": {
+    "schedule": "tsx src/scheduleMessage.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^12.10.0",
+    "dotenv": "^17.4.2",
+    "googleapis": "^171.4.0",
+    "input": "^1.0.1",
+    "node-cron": "^4.2.1",
+    "telegram": "^2.26.22"
+  },
+  "devDependencies": {
+    "@types/node": "^25.8.0",
+    "tsx": "^4.22.0",
+    "typescript": "^6.0.3"
+  }
+}
