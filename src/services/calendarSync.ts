@@ -1,3 +1,4 @@
+import "dotenv/config";
 import fs from "fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +31,8 @@ type ExistingLesson = {
 };
 
 type SyncResult = {
+  timeMin: string;
+  timeMax: string;
   scannedEvents: number;
   matchedEvents: number;
   insertedLessons: number;
@@ -37,6 +40,36 @@ type SyncResult = {
   skippedProtectedLessons: number;
   createdPayments: number;
 };
+
+type SyncWindow = {
+  timeMin: string;
+  timeMax: string;
+  maxResults: number;
+};
+
+function getPositiveIntegerEnv(name: string, fallback: number): number {
+  const rawValue = process.env[name];
+  const parsedValue = rawValue ? Number.parseInt(rawValue, 10) : NaN;
+
+  return Number.isInteger(parsedValue) && parsedValue > 0
+    ? parsedValue
+    : fallback;
+}
+
+function createSyncWindow(now = new Date()): SyncWindow {
+  const pastDays = getPositiveIntegerEnv("CALENDAR_SYNC_PAST_DAYS", 1);
+  const futureDays = getPositiveIntegerEnv("CALENDAR_SYNC_FUTURE_DAYS", 45);
+  const maxResults = getPositiveIntegerEnv("CALENDAR_SYNC_MAX_RESULTS", 250);
+  const millisecondsPerDay = 24 * 60 * 60 * 1000;
+
+  return {
+    timeMin: new Date(now.getTime() - pastDays * millisecondsPerDay).toISOString(),
+    timeMax: new Date(
+      now.getTime() + futureDays * millisecondsPerDay
+    ).toISOString(),
+    maxResults,
+  };
+}
 
 function createCalendarClient(): calendar_v3.Calendar {
   const credentials = JSON.parse(fs.readFileSync(credentialsPath, "utf8"));
@@ -85,7 +118,8 @@ function findMatchingStudent(
 }
 
 async function listUpcomingEvents(
-  calendar: calendar_v3.Calendar
+  calendar: calendar_v3.Calendar,
+  syncWindow: SyncWindow
 ): Promise<calendar_v3.Schema$Event[]> {
   const events: calendar_v3.Schema$Event[] = [];
   let pageToken: string | undefined;
@@ -96,7 +130,9 @@ async function listUpcomingEvents(
       singleEvents: true,
       showDeleted: true,
       orderBy: "startTime",
-      timeMin: new Date().toISOString(),
+      timeMin: syncWindow.timeMin,
+      timeMax: syncWindow.timeMax,
+      maxResults: syncWindow.maxResults,
       pageToken,
     });
 
@@ -109,6 +145,7 @@ async function listUpcomingEvents(
 
 export async function syncCalendarLessons(): Promise<SyncResult> {
   const calendar = createCalendarClient();
+  const syncWindow = createSyncWindow();
   const students = db
     .prepare(
       `
@@ -169,6 +206,8 @@ export async function syncCalendarLessons(): Promise<SyncResult> {
   );
 
   const result: SyncResult = {
+    timeMin: syncWindow.timeMin,
+    timeMax: syncWindow.timeMax,
     scannedEvents: 0,
     matchedEvents: 0,
     insertedLessons: 0,
@@ -177,7 +216,7 @@ export async function syncCalendarLessons(): Promise<SyncResult> {
     createdPayments: 0,
   };
 
-  const events = await listUpcomingEvents(calendar);
+  const events = await listUpcomingEvents(calendar, syncWindow);
   result.scannedEvents = events.length;
 
   const syncEvent = db.transaction((event: calendar_v3.Schema$Event) => {
