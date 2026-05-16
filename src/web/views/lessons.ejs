@@ -6,11 +6,12 @@
   <thead>
     <tr>
       <th>ID</th>
-      <th>Title</th>
+      <!-- <th>Title</th> -->
       <th>Student</th>
       <th>Start time</th>
       <th>Status</th>
       <th>Student response</th>
+      <th>Cancellation reason</th>
       <th>Payment status</th>
       <th>Payment method</th>
       <th>Package progress</th>
@@ -22,11 +23,17 @@
     <% lessons.forEach((lesson) => { %>
       <tr>
         <td><%= lesson.id %></td>
-        <td><%= lesson.title %></td>
+        <!-- <td><%= lesson.title %></td> -->
         <td><%= lesson.name_ru %></td>
         <td><%= lesson.start_time %></td>
         <td><%= lesson.status %></td>
         <td><%= lesson.student_response %></td>
+        <td>
+          <% if (lesson.cancellation_reason) { %>
+            <%= lesson.cancellation_reason %><br>
+            <!-- Cancellation requested at: <%= lesson.cancellation_requested_at %> -->
+          <% } %>
+        </td>
         <td><%= lesson.payment_status %></td>
         <td><%= lesson.payment_method %></td>
         <td><%= lesson.packageProgress %></td>
@@ -42,12 +49,12 @@
             </div>
           <% } else { %>
             <div class="ai-receipt">
-              <strong>AI receipt analysis</strong><br>
+              <!-- <strong>AI receipt analysis</strong><br> -->
               Confirmed: <%= lesson.aiReceipt.paymentConfirmed ? "yes" : "no" %><br>
               Amount: <%= lesson.aiReceipt.amount %> <%= lesson.aiReceipt.currency %><br>
               Date: <%= lesson.aiReceipt.paymentDate %><br>
-              Confidence: <%= lesson.aiReceipt.confidence %><br>
-              Reason: <%= lesson.aiReceipt.reason %>
+              <!-- Confidence: <%= lesson.aiReceipt.confidence %><br> -->
+              <!-- Reason: <%= lesson.aiReceipt.reason %> -->
             </div>
           <% } %>
         </td>

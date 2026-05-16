@@ -43,10 +43,10 @@
       <th>Name RU</th>
       <th>Name AR</th>
       <th>Telegram username</th>
-      <th>Telegram ID</th>
-      <th>Calendar keyword</th>
+      <!-- <th>Telegram ID</th> -->
+      <!-- <th>Calendar keyword</th> -->
       <th>Active</th>
-      <th>Created</th>
+      <!-- <th>Created</th> -->
       <th>Active package</th>
       <th>Remaining lessons</th>
     </tr>
@@ -58,10 +58,10 @@
         <td><%= student.name_ru %></td>
         <td><%= student.name_ar %></td>
         <td><%= student.telegram_username %></td>
-        <td><%= student.telegram_id %></td>
-        <td><%= student.calendar_keyword %></td>
+        <!-- <td><%= student.telegram_id %></td> -->
+        <!-- <td><%= student.calendar_keyword %></td> -->
         <td><%= student.is_active %></td>
-        <td><%= student.created_at %></td>
+        <!-- <td><%= student.created_at %></td> -->
         <td>
           <% if (student.package_id) { %>
             <%= student.package_used_lessons %> / <%= student.package_total_lessons %>

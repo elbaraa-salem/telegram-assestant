@@ -51,26 +51,48 @@ function getReminderTarget(lesson: ReminderLesson): string | null {
   return null;
 }
 
-function formatLessonTime(startTime: string): string {
+function formatLessonDate(startTime: string): {
+  weekday: string;
+  day: string;
+  month: string;
+  time: string;
+} {
   const timeZone = process.env.APP_TIMEZONE ?? "Europe/Moscow";
+  const lessonDate = new Date(startTime);
 
-  return new Intl.DateTimeFormat("ru-RU", {
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone,
-  }).format(new Date(startTime));
+  return {
+    weekday: new Intl.DateTimeFormat("ru-RU", {
+      weekday: "long",
+      timeZone,
+    }).format(lessonDate),
+    day: new Intl.DateTimeFormat("ru-RU", {
+      day: "numeric",
+      timeZone,
+    }).format(lessonDate),
+    month: new Intl.DateTimeFormat("ru-RU", {
+      month: "long",
+      timeZone,
+    }).format(lessonDate),
+    time: new Intl.DateTimeFormat("ru-RU", {
+      hour: "2-digit",
+      minute: "2-digit",
+      timeZone,
+    }).format(lessonDate),
+  };
 }
 
 function buildReminderMessage(lesson: ReminderLesson): string {
-  const time = formatLessonTime(lesson.start_time);
+  const { weekday, day, month, time } = formatLessonDate(lesson.start_time);
 
   return `Привет, ${lesson.name_ru} 👋
 
-Напоминаю: завтра у нас урок в ${time}.
+У нас урок в ${weekday}, ${day} ${month}, в ${time}.
 
-Ответь, пожалуйста(цефрами):
+Ответь:
 1 — да, я готов
-2 — нет, нужно отменить`;
+2 — нет, нужно отменить
+
+Можно ответить цифрой или словами.`;
 }
 
 export async function sendLessonReminders(): Promise<ReminderResult> {

@@ -32,6 +32,8 @@ type LessonRow = {
   start_time: string;
   status: string;
   student_response: string | null;
+  cancellation_reason: string | null;
+  cancellation_requested_at: string | null;
   payment_status: string | null;
   payment_method: string | null;
   package_used_lessons: number | null;
@@ -313,6 +315,8 @@ app.get("/lessons", (_request, response) => {
           lessons.start_time,
           lessons.status,
           lessons.student_response,
+          lessons.cancellation_reason,
+          lessons.cancellation_requested_at,
           payments.status AS payment_status,
           payments.payment_method,
           lesson_packages.used_lessons AS package_used_lessons,

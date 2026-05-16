@@ -63,6 +63,9 @@ db.exec(`
     payment_request_sent INTEGER NOT NULL DEFAULT 0,
 
     cancellation_source TEXT,
+    awaiting_cancellation_reason INTEGER NOT NULL DEFAULT 0,
+    cancellation_reason TEXT,
+    cancellation_requested_at TEXT,
     ai_cancellation_confidence REAL,
 
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -214,6 +217,11 @@ function addPaymentColumnIfMissing(columnName: string, definition: string): void
 
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response TEXT");
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response_at TEXT");
+addColumnIfMissing(
+  "ALTER TABLE lessons ADD COLUMN awaiting_cancellation_reason INTEGER NOT NULL DEFAULT 0"
+);
+addColumnIfMissing("ALTER TABLE lessons ADD COLUMN cancellation_reason TEXT");
+addColumnIfMissing("ALTER TABLE lessons ADD COLUMN cancellation_requested_at TEXT");
 addColumnIfMissing("ALTER TABLE payments ADD COLUMN prepaid_package_id INTEGER");
 addColumnIfMissing("ALTER TABLE payments ADD COLUMN payment_method TEXT");
 addColumnIfMissing("ALTER TABLE telegram_messages ADD COLUMN sender_id TEXT");

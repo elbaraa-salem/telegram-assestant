@@ -1,13 +1,17 @@
 body {
   margin: 32px;
-  color: #1f2937;
+  color: #7c7c7c;
   font-family: Arial, sans-serif;
+  background-color: #131314;
 }
 body nav {
   margin-bottom: 24px;
 }
 body nav a {
   margin-right: 16px;
+    text-decoration: none;
+    color: #005577;
+    font-size: 18px;
 }
 
 .page-header {
@@ -15,14 +19,16 @@ body nav a {
 }
 
 .form-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 420px));
+  /* display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 420px)); */
+  display: flex;
+  justify-content: space-between;
   gap: 20px;
   align-items: start;
 }
 
 .card {
-  border: 1px solid #d1d5db;
+  border: 1px solid #7c7c7c;
   border-radius: 8px;
   padding: 16px;
 }
@@ -39,6 +45,8 @@ body nav a {
   width: 100%;
   margin-top: 4px;
   padding: 8px;
+  background-color: #7c7c7c;
+  border: none;
 }
 
 .table {
@@ -48,18 +56,23 @@ body nav a {
 }
 .table th,
 .table td {
-  border: 1px solid #d1d5db;
+  border: 1px solid #919191;
   padding: 8px;
-  text-align: left;
+  text-align: center;
   vertical-align: top;
 }
 .table th {
-  background: #f3f4f6;
+  background-color: #7c7c7c;
+  color: #131314;
 }
 
 .button {
   margin-top: 12px;
   padding: 8px 12px;
+  background-color: #004967;
+  border: 1px #ababab solid;
+  cursor: pointer;
+  color: white;
 }
 
 .actions form {
@@ -76,8 +89,9 @@ body nav a {
 
 .help-text {
   margin: 8px 0 0;
-  color: #4b5563;
+  color: #7c7c7c;
   font-size: 14px;
 }
+
 
 /*# sourceMappingURL=main.css.map */

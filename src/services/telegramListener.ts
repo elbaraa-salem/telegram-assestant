@@ -39,6 +39,7 @@ type Lesson = {
   start_time: string;
   status: string;
   student_response: string | null;
+  awaiting_cancellation_reason: number;
 };
 
 function findNearestRemindedLesson(studentId: number): Lesson | null {
@@ -48,7 +49,7 @@ function findNearestRemindedLesson(studentId: number): Lesson | null {
   const lessons = db
     .prepare(
       `
-        SELECT id, start_time, status, student_response
+        SELECT id, start_time, status, student_response, awaiting_cancellation_reason
         FROM lessons
         WHERE student_id = ?
           AND reminder_sent = 1
@@ -289,6 +290,7 @@ type ProcessingSource = "event" | "polling";
 type ProcessingAction =
   | "confirmed_lesson"
   | "cancelled_lesson"
+  | "cancellation_reason"
   | "saved_receipt"
   | "ignored"
   | "duplicate";
@@ -297,6 +299,59 @@ type StoredTelegramMessage = {
   id: number;
   processing_status: string | null;
 };
+
+type StudentReplyIntent = "ready" | "cancel" | "cancellation_reason" | "unknown";
+
+function normalizeReplyText(text: string): string {
+  return text
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[.,!?،؛:;]/g, "")
+    .replace(/\s+/g, " ");
+}
+
+function parseStudentReplyIntent(text: string): Exclude<StudentReplyIntent, "cancellation_reason"> {
+  const normalized = normalizeReplyText(text);
+  const cancellationPhrases = new Set([
+    "2",
+    "нет",
+    "не могу",
+    "не получится",
+    "отмена",
+    "отменить",
+    "нужно отменить",
+    "я не смогу",
+    "не готов",
+  ]);
+  const readyPhrases = new Set([
+    "1",
+    "да",
+    "да я готов",
+    "я готов",
+    "готов",
+    "буду",
+    "ок",
+    "окей",
+    "хорошо",
+    "+",
+    "yes",
+  ]);
+
+  if (
+    cancellationPhrases.has(normalized) ||
+    normalized.includes("не готов") ||
+    normalized.includes("не могу") ||
+    normalized.includes("не смогу")
+  ) {
+    return "cancel";
+  }
+
+  if (readyPhrases.has(normalized)) {
+    return "ready";
+  }
+
+  return "unknown";
+}
 
 function getMessageType(
   message: NewMessageEvent["message"],
@@ -498,14 +553,6 @@ async function processTelegramMessage(
     return action;
   }
 
-  const text = message.message?.trim();
-
-  if (text !== "1" && text !== "2") {
-    console.log("Ignored non-command non-PDF message");
-    markTelegramMessageProcessed(storedMessage.id, student.id);
-    return "ignored";
-  }
-
   const lesson = findNearestRemindedLesson(student.id);
 
   if (!lesson) {
@@ -513,7 +560,48 @@ async function processTelegramMessage(
     return "ignored";
   }
 
-  if (text === "1") {
+  const text = message.message?.trim() ?? "";
+  let intent: StudentReplyIntent = parseStudentReplyIntent(text);
+
+  if (intent === "unknown" && lesson.awaiting_cancellation_reason === 1 && text) {
+    intent = "cancellation_reason";
+  }
+
+  console.log("Parsed student reply intent", {
+    studentId: student.id,
+    lessonId: lesson.id,
+    intent,
+  });
+
+  if (intent === "cancellation_reason") {
+    db.prepare(
+      `
+        UPDATE lessons
+        SET awaiting_cancellation_reason = 0,
+            cancellation_reason = ?,
+            updated_at = datetime('now')
+        WHERE id = ?
+      `
+    ).run(text, lesson.id);
+
+    await message.respond({
+      message: "Спасибо, я получил причину. Я посмотрю и отвечу вручную.",
+    });
+    console.log("Cancellation reason saved", {
+      lessonId: lesson.id,
+      studentId: student.id,
+    });
+    markTelegramMessageProcessed(storedMessage.id, student.id);
+    return "cancellation_reason";
+  }
+
+  if (intent === "unknown") {
+    console.log("Ignored non-command non-PDF message");
+    markTelegramMessageProcessed(storedMessage.id, student.id);
+    return "ignored";
+  }
+
+  if (intent === "ready") {
     if (
       lesson.status === "confirmed" &&
       lesson.student_response === "ready"
@@ -576,12 +664,25 @@ async function processTelegramMessage(
   const hoursUntilLesson = (lessonStartTime - Date.now()) / (60 * 60 * 1000);
 
   if (hoursUntilLesson <= cancellationDeadlineHours) {
+    db.prepare(
+      `
+        UPDATE lessons
+        SET awaiting_cancellation_reason = 1,
+            cancellation_requested_at = datetime('now'),
+            updated_at = datetime('now')
+        WHERE id = ?
+      `
+    ).run(lesson.id);
+
     await message.respond({
       message:
-        "Извини, я не могу отменить урок менее чем за 10 часов до начала. Напиши преподавателю напрямую.",
+        "К сожалению, я не могу автоматически отменить урок менее чем за 10 часов до начала.\n\nНапиши, пожалуйста, причину здесь — я посмотрю и отвечу вручную.",
     });
 
-    console.log(`Cancellation rejected because deadline passed for lesson ${lesson.id}`);
+    console.log("Cancellation blocked because less than 10 hours remain", {
+      lessonId: lesson.id,
+      studentId: student.id,
+    });
     markTelegramMessageProcessed(storedMessage.id, student.id);
     return "ignored";
   }
