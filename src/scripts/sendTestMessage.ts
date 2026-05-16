@@ -32,6 +32,9 @@ async function main() {
     onError: (err) => console.error(err),
   });
 
+  console.log("sendTestMessage Telegram client connected", {
+    pid: process.pid,
+  });
   console.log("Logged in successfully.");
 
   if (!sessionString) {
@@ -59,6 +62,9 @@ await client.sendMessage(target, {
   console.log("Message scheduled successfully.");
 
   await client.disconnect();
+  console.log("sendTestMessage Telegram client disconnected", {
+    pid: process.pid,
+  });
 }
 
 main().catch((err) => {

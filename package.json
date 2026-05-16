@@ -10,7 +10,11 @@
     "listen:telegram": "tsx src/services/telegramListener.ts",
     "admin": "tsx src/web/server.ts",
     "sync:telegram-ids": "tsx src/scripts/syncTelegramIds.ts",
-    "sync:calendar": "tsx src/services/calendarSync.ts"
+    "sync:calendar": "tsx src/services/calendarSync.ts",
+    "test:openrouter": "tsx src/scripts/testOpenRouter.ts",
+    "test:pdf-text": "tsx src/scripts/extractReceiptText.ts",
+    "test:receipt-ai": "tsx src/scripts/analyzeReceiptWithAi.ts",
+    "test:receipt-ai-db": "tsx src/scripts/analyzePaymentReceiptToDb.ts"
   },
   "keywords": [],
   "author": "",
@@ -22,12 +26,14 @@
     "googleapis": "^171.4.0",
     "input": "^1.0.1",
     "node-cron": "^4.2.1",
+    "pdf-parse": "^2.4.5",
     "telegram": "^2.26.22"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^5.0.6",
     "@types/node": "^25.8.0",
+    "@types/pdf-parse": "^1.1.5",
     "tsx": "^4.22.0",
     "typescript": "^6.0.3"
   }

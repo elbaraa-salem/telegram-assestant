@@ -12,7 +12,9 @@ if (!apiId || !apiHash || !phoneNumber) {
   throw new Error("Missing TG_API_ID, TG_API_HASH, or TG_PHONE in .env");
 }
 
-export async function getTelegramClient(): Promise<TelegramClient> {
+export async function getTelegramClient(
+  serviceName = "unknownService"
+): Promise<TelegramClient> {
   const client = new TelegramClient(
     new StringSession(sessionString),
     apiId,
@@ -27,6 +29,10 @@ export async function getTelegramClient(): Promise<TelegramClient> {
     password: async () => await input.text("Telegram 2FA password: "),
     phoneCode: async () => await input.text("Telegram code: "),
     onError: (error) => console.error(error),
+  });
+
+  console.log(`${serviceName} Telegram client connected`, {
+    pid: process.pid,
   });
 
   if (!sessionString) {

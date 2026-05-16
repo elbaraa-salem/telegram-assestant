@@ -76,16 +76,34 @@ db.exec(`
     receipt_file_path TEXT,
     receipt_text TEXT,
 
-    ai_amount INTEGER,
+    ai_amount REAL,
     ai_currency TEXT,
     ai_payment_date TEXT,
     ai_confidence REAL,
     ai_raw_result TEXT,
 
+    prepaid_package_id INTEGER,
+    payment_method TEXT,
+
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     FOREIGN KEY (lesson_id) REFERENCES lessons(id),
+    FOREIGN KEY (student_id) REFERENCES students(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS lesson_packages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id INTEGER NOT NULL,
+    total_lessons INTEGER NOT NULL,
+    used_lessons INTEGER NOT NULL DEFAULT 0,
+    amount REAL,
+    currency TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    paid_at TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (student_id) REFERENCES students(id)
   );
 
@@ -144,5 +162,29 @@ function addColumnIfMissing(sql: string): void {
   }
 }
 
+function paymentColumnExists(columnName: string): boolean {
+  const columns = db.prepare("PRAGMA table_info(payments)").all() as Array<{
+    name: string;
+  }>;
+
+  return columns.some((column) => column.name === columnName);
+}
+
+function addPaymentColumnIfMissing(columnName: string, definition: string): void {
+  if (paymentColumnExists(columnName)) {
+    return;
+  }
+
+  db.exec(`ALTER TABLE payments ADD COLUMN ${definition}`);
+}
+
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response TEXT");
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response_at TEXT");
+addColumnIfMissing("ALTER TABLE payments ADD COLUMN prepaid_package_id INTEGER");
+addColumnIfMissing("ALTER TABLE payments ADD COLUMN payment_method TEXT");
+addPaymentColumnIfMissing("receipt_text", "receipt_text TEXT");
+addPaymentColumnIfMissing("ai_amount", "ai_amount REAL");
+addPaymentColumnIfMissing("ai_currency", "ai_currency TEXT");
+addPaymentColumnIfMissing("ai_payment_date", "ai_payment_date TEXT");
+addPaymentColumnIfMissing("ai_confidence", "ai_confidence REAL");
+addPaymentColumnIfMissing("ai_raw_result", "ai_raw_result TEXT");

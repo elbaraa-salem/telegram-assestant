@@ -141,7 +141,7 @@ export async function sendLessonReminders(): Promise<ReminderResult> {
     `
   );
 
-  const client = await getTelegramClient();
+  const client = await getTelegramClient("reminderService");
 
   try {
     for (const lesson of lessonsToSend) {
@@ -161,6 +161,9 @@ export async function sendLessonReminders(): Promise<ReminderResult> {
     }
   } finally {
     await client.disconnect();
+    console.log("reminderService Telegram client disconnected", {
+      pid: process.pid,
+    });
   }
 
   return result;

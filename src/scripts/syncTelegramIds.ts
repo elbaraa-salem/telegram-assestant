@@ -30,6 +30,9 @@ async function main() {
     onError: (err) => console.error(err),
   });
 
+  console.log("syncTelegramIds Telegram client connected", {
+    pid: process.pid,
+  });
   console.log("\nTelegram login successful.");
 
   if (!sessionString) {
@@ -76,6 +79,9 @@ async function main() {
   }
 
   await client.disconnect();
+  console.log("syncTelegramIds Telegram client disconnected", {
+    pid: process.pid,
+  });
 }
 
 main().catch(console.error);
