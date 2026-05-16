@@ -1,0 +1,78 @@
+<section class="page-header">
+  <h1>Students</h1>
+</section>
+
+<section class="form-grid">
+  <form class="card form" method="post" action="/students">
+    <h2>Add student</h2>
+    <label>Russian name <input name="name_ru"></label>
+    <label>Arabic name <input name="name_ar"></label>
+    <label>Telegram username <input name="telegram_username"></label>
+    <label>Telegram ID <input name="telegram_id"></label>
+    <p class="help-text">Optional. If empty, it will be resolved automatically from Telegram username or first message.</p>
+    <label>Calendar keyword <input name="calendar_keyword" required></label>
+    <button class="button" type="submit">Create student</button>
+  </form>
+
+  <form class="card form" method="post" action="/packages">
+    <h2>Add package</h2>
+    <label>Student
+      <input name="student_query" list="students-list" required>
+    </label>
+    <datalist id="students-list">
+      <% students.forEach((student) => { %>
+        <option value="<%= student.id %>"><%= student.name_ru %> <%= student.name_ar %></option>
+        <% if (student.name_ru) { %><option value="<%= student.name_ru %>"></option><% } %>
+        <% if (student.name_ar) { %><option value="<%= student.name_ar %>"></option><% } %>
+        <% if (student.telegram_username) { %><option value="<%= student.telegram_username %>"></option><% } %>
+        <option value="<%= student.calendar_keyword %>"></option>
+      <% }) %>
+    </datalist>
+    <label>Total lessons <input name="total_lessons" type="number" min="1" required></label>
+    <label>Amount <input name="amount" type="number" step="0.01"></label>
+    <label>Currency <input name="currency" value="RUB"></label>
+    <label>Note <input name="note"></label>
+    <button class="button" type="submit">Create package</button>
+  </form>
+</section>
+
+<table class="table">
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Name RU</th>
+      <th>Name AR</th>
+      <th>Telegram username</th>
+      <th>Telegram ID</th>
+      <th>Calendar keyword</th>
+      <th>Active</th>
+      <th>Created</th>
+      <th>Active package</th>
+      <th>Remaining lessons</th>
+    </tr>
+  </thead>
+  <tbody>
+    <% students.forEach((student) => { %>
+      <tr>
+        <td><%= student.id %></td>
+        <td><%= student.name_ru %></td>
+        <td><%= student.name_ar %></td>
+        <td><%= student.telegram_username %></td>
+        <td><%= student.telegram_id %></td>
+        <td><%= student.calendar_keyword %></td>
+        <td><%= student.is_active %></td>
+        <td><%= student.created_at %></td>
+        <td>
+          <% if (student.package_id) { %>
+            <%= student.package_used_lessons %> / <%= student.package_total_lessons %>
+          <% } %>
+        </td>
+        <td>
+          <% if (student.package_id && student.package_total_lessons !== null && student.package_used_lessons !== null) { %>
+            <%= student.package_total_lessons - student.package_used_lessons %>
+          <% } %>
+        </td>
+      </tr>
+    <% }) %>
+  </tbody>
+</table>

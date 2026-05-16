@@ -1,0 +1,71 @@
+<section class="page-header">
+  <h1>Lessons</h1>
+</section>
+
+<table class="table">
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Title</th>
+      <th>Student</th>
+      <th>Start time</th>
+      <th>Status</th>
+      <th>Student response</th>
+      <th>Payment status</th>
+      <th>Payment method</th>
+      <th>Package progress</th>
+      <th>AI receipt analysis</th>
+      <th>Action</th>
+    </tr>
+  </thead>
+  <tbody>
+    <% lessons.forEach((lesson) => { %>
+      <tr>
+        <td><%= lesson.id %></td>
+        <td><%= lesson.title %></td>
+        <td><%= lesson.name_ru %></td>
+        <td><%= lesson.start_time %></td>
+        <td><%= lesson.status %></td>
+        <td><%= lesson.student_response %></td>
+        <td><%= lesson.payment_status %></td>
+        <td><%= lesson.payment_method %></td>
+        <td><%= lesson.packageProgress %></td>
+        <td>
+          <% if (!lesson.aiReceipt.hasReceipt) { %>
+            No receipt
+          <% } else if (!lesson.aiReceipt.hasAiResult) { %>
+            Receipt received, AI analysis not available yet.
+          <% } else if (lesson.aiReceipt.parseFailed) { %>
+            <div class="ai-receipt">
+              <strong>AI receipt analysis</strong><br>
+              Raw result: <%= lesson.aiReceipt.rawResult %>
+            </div>
+          <% } else { %>
+            <div class="ai-receipt">
+              <strong>AI receipt analysis</strong><br>
+              Confirmed: <%= lesson.aiReceipt.paymentConfirmed ? "yes" : "no" %><br>
+              Amount: <%= lesson.aiReceipt.amount %> <%= lesson.aiReceipt.currency %><br>
+              Date: <%= lesson.aiReceipt.paymentDate %><br>
+              Confidence: <%= lesson.aiReceipt.confidence %><br>
+              Reason: <%= lesson.aiReceipt.reason %>
+            </div>
+          <% } %>
+        </td>
+        <td class="actions">
+          <% if (lesson.canComplete) { %>
+            <form method="post" action="/lessons/<%= lesson.id %>/complete">
+              <button class="button" type="submit">تم الدرس</button>
+            </form>
+          <% } %>
+          <% if (lesson.payment_status === "confirmed") { %>
+            مدفوع
+          <% } else if (lesson.canConfirmPayment) { %>
+            <form method="post" action="/lessons/<%= lesson.id %>/confirm-payment">
+              <button class="button" type="submit">الدرس تم دفعه</button>
+            </form>
+          <% } %>
+        </td>
+      </tr>
+    <% }) %>
+  </tbody>
+</table>

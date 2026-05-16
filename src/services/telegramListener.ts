@@ -13,10 +13,15 @@ const cancellationDeadlineHours = Number(
 );
 const reconnectDelayMs = 3_000;
 const healthCheckIntervalMs = 60_000;
+const pollingIntervalMs = Number(
+  process.env.TELEGRAM_LISTENER_POLL_INTERVAL_MS ?? 5_000
+);
+const pollingLimit = Number(process.env.TELEGRAM_LISTENER_POLL_LIMIT ?? 5);
 
 type Student = {
   id: number;
   telegram_id: string;
+  telegram_username?: string | null;
 };
 
 type PdfReceiptPaymentCandidate = {
@@ -74,29 +79,6 @@ function findNearestRemindedLesson(studentId: number): Lesson | null {
   return activeLessons[0]?.lesson ?? null;
 }
 
-function saveTelegramMessage(
-  studentId: number,
-  chatId: string,
-  messageId: string,
-  text: string,
-  sentAt: string
-): void {
-  db.prepare(
-    `
-      INSERT OR IGNORE INTO telegram_messages (
-        student_id,
-        telegram_chat_id,
-        telegram_message_id,
-        sender,
-        text,
-        sent_at,
-        created_at
-      )
-      VALUES (?, ?, ?, 'student', ?, ?, datetime('now'))
-    `
-  ).run(studentId, chatId, messageId, text, sentAt);
-}
-
 function findStudentByTelegramId(telegramId: string): Student | undefined {
   return db
     .prepare(
@@ -107,6 +89,23 @@ function findStudentByTelegramId(telegramId: string): Student | undefined {
       `
     )
     .get(telegramId) as Student | undefined;
+}
+
+function normalizeTelegramUsername(username: string): string {
+  const trimmed = username.trim();
+  return trimmed.startsWith("@") ? trimmed : `@${trimmed}`;
+}
+
+function findStudentByTelegramUsername(username: string): Student | undefined {
+  return db
+    .prepare(
+      `
+        SELECT id, telegram_id, telegram_username
+        FROM students
+        WHERE telegram_username = ?
+      `
+    )
+    .get(username) as Student | undefined;
 }
 
 function getDocumentFilename(document: Api.Document): string | undefined {
@@ -213,10 +212,10 @@ async function handlePdfReceipt(
   student: Student,
   chatId: string,
   document: Api.Document
-): Promise<void> {
+): Promise<"saved_receipt" | "ignored"> {
   if (!isPdfDocument(document)) {
     console.log("Document received but not PDF");
-    return;
+    return "ignored";
   }
 
   console.log("PDF receipt detected");
@@ -228,7 +227,7 @@ async function handlePdfReceipt(
     await message.respond({
       message: "Сейчас я не ожидаю чек об оплате.",
     });
-    return;
+    return "ignored";
   }
 
   console.log(`Payment found for PDF receipt: ${payment.id}`);
@@ -239,14 +238,6 @@ async function handlePdfReceipt(
   await fs.mkdir(receiptsDir, { recursive: true });
   await message.downloadMedia({ outputFile: receiptPath });
   console.log(`Receipt saved: ${receiptPath}`);
-
-  saveTelegramMessage(
-    student.id,
-    chatId,
-    message.id.toString(),
-    message.message ?? "",
-    new Date(message.date * 1000).toISOString()
-  );
 
   db.prepare(
     `
@@ -291,10 +282,66 @@ async function handlePdfReceipt(
   });
 
   console.log(`PDF receipt saved for payment ${payment.id}`);
+  return "saved_receipt";
 }
 
-async function handleIncomingMessage(event: NewMessageEvent): Promise<void> {
-  const message = event.message;
+type ProcessingSource = "event" | "polling";
+type ProcessingAction =
+  | "confirmed_lesson"
+  | "cancelled_lesson"
+  | "saved_receipt"
+  | "ignored"
+  | "duplicate";
+
+type StoredTelegramMessage = {
+  id: number;
+  processing_status: string | null;
+};
+
+function getMessageType(
+  message: NewMessageEvent["message"],
+  document: Api.Document | undefined
+): "text" | "pdf" | "other" {
+  if (document && isPdfDocument(document)) {
+    return "pdf";
+  }
+
+  return message.message?.trim() ? "text" : "other";
+}
+
+function markTelegramMessageProcessed(
+  rowId: number,
+  studentId: number | null
+): void {
+  db.prepare(
+    `
+      UPDATE telegram_messages
+      SET student_id = ?,
+          processed_at = datetime('now'),
+          processing_status = 'processed',
+          error = NULL
+      WHERE id = ?
+    `
+  ).run(studentId, rowId);
+}
+
+function markTelegramMessageError(rowId: number, error: unknown): void {
+  db.prepare(
+    `
+      UPDATE telegram_messages
+      SET processed_at = datetime('now'),
+          processing_status = 'error',
+          error = ?
+      WHERE id = ?
+    `
+  ).run(error instanceof Error ? error.message : "unknown error", rowId);
+}
+
+async function processTelegramMessage(
+  _client: TelegramClient,
+  message: NewMessageEvent["message"],
+  source: ProcessingSource
+): Promise<ProcessingAction> {
   const document = getMessageDocument(message);
   const messageText = message.message ?? "";
   const mediaClassName = message.media?.className ?? null;
@@ -312,7 +359,7 @@ async function handleIncomingMessage(event: NewMessageEvent): Promise<void> {
   });
 
   if (message.out) {
-    return;
+    return "ignored";
   }
 
   const sender = await message.getSender();
@@ -320,34 +367,150 @@ async function handleIncomingMessage(event: NewMessageEvent): Promise<void> {
   const chatId = message.chatId?.toString();
 
   if (!sender || !senderTelegramId || !chatId) {
-    return;
+    return "ignored";
   }
 
-  const student = findStudentByTelegramId(senderTelegramId);
+  const messageType = getMessageType(message, document);
+  const messageDate = new Date(message.date * 1000).toISOString();
+  db.prepare(
+    `
+      INSERT OR IGNORE INTO telegram_messages (
+        telegram_chat_id,
+        telegram_message_id,
+        sender_id,
+        message_date,
+        sender,
+        text,
+        sent_at,
+        has_media,
+        media_type,
+        processing_status,
+        created_at
+      )
+      VALUES (?, ?, ?, ?, 'student', ?, ?, ?, ?, 'pending', datetime('now'))
+    `
+  ).run(
+    chatId,
+    message.id.toString(),
+    senderTelegramId,
+    messageDate,
+    message.message ?? null,
+    messageDate,
+    message.media ? 1 : 0,
+    document ? document.mimeType : message.media?.className ?? null
+  );
+
+  const storedMessage = db
+    .prepare(
+      `
+        SELECT id, processing_status
+        FROM telegram_messages
+        WHERE telegram_chat_id = ?
+          AND telegram_message_id = ?
+      `
+    )
+    .get(chatId, message.id.toString()) as StoredTelegramMessage;
+
+  if (storedMessage.processing_status === "processed") {
+    console.log("Processed Telegram message", {
+      source,
+      chat_id: chatId,
+      message_id: message.id.toString(),
+      sender_id: senderTelegramId,
+      message_type: messageType,
+      action: "duplicate",
+    });
+    return "duplicate";
+  }
+
+  const claimResult = db
+    .prepare(
+      `
+        UPDATE telegram_messages
+        SET processing_status = 'processing'
+        WHERE id = ?
+          AND (
+            processing_status IS NULL
+            OR processing_status IN ('pending', 'error')
+          )
+      `
+    )
+    .run(storedMessage.id);
+
+  if (claimResult.changes === 0) {
+    console.log("Processed Telegram message", {
+      source,
+      chat_id: chatId,
+      message_id: message.id.toString(),
+      sender_id: senderTelegramId,
+      message_type: messageType,
+      action: "duplicate",
+    });
+    return "duplicate";
+  }
+
+  let student = findStudentByTelegramId(senderTelegramId);
+  const senderUsername =
+    sender instanceof Api.User && sender.username
+      ? normalizeTelegramUsername(sender.username)
+      : null;
+
+  if (!student && senderUsername) {
+    student = findStudentByTelegramUsername(senderUsername);
+
+    if (student) {
+      db.prepare("UPDATE students SET telegram_id = ? WHERE id = ?").run(
+        senderTelegramId,
+        student.id
+      );
+      student.telegram_id = senderTelegramId;
+
+      console.log("Student telegram_id learned from incoming message", {
+        studentId: student.id,
+        username: senderUsername,
+        senderId: senderTelegramId,
+      });
+    }
+  }
 
   if (!student) {
-    console.log("No matching student");
-    return;
+    console.log("No matching student", {
+      senderId: senderTelegramId,
+      username: senderUsername,
+    });
+    markTelegramMessageProcessed(storedMessage.id, null);
+    return "ignored";
   }
 
   console.log(`Incoming message from student ${student.id}`);
 
   if (document) {
-    await handlePdfReceipt(message, student, chatId, document);
-    return;
+    const action = await handlePdfReceipt(message, student, chatId, document);
+    markTelegramMessageProcessed(storedMessage.id, student.id);
+    console.log("Processed Telegram message", {
+      source,
+      chat_id: chatId,
+      message_id: message.id.toString(),
+      sender_id: senderTelegramId,
+      message_type: messageType,
+      action,
+    });
+    return action;
   }
 
   const text = message.message?.trim();
 
   if (text !== "1" && text !== "2") {
     console.log("Ignored non-command non-PDF message");
-    return;
+    markTelegramMessageProcessed(storedMessage.id, student.id);
+    return "ignored";
   }
 
   const lesson = findNearestRemindedLesson(student.id);
 
   if (!lesson) {
-    return;
+    markTelegramMessageProcessed(storedMessage.id, student.id);
+    return "ignored";
   }
 
   if (text === "1") {
@@ -356,28 +519,22 @@ async function handleIncomingMessage(event: NewMessageEvent): Promise<void> {
       lesson.student_response === "ready"
     ) {
       console.log(`Ignored duplicate ready response for lesson ${lesson.id}`);
-      return;
+      markTelegramMessageProcessed(storedMessage.id, student.id);
+      return "ignored";
     }
 
     if (
       lesson.status === "cancelled_by_student" ||
       lesson.status === "cancelled_by_teacher"
     ) {
-      saveTelegramMessage(
-        student.id,
-        chatId,
-        message.id.toString(),
-        text,
-        new Date(message.date * 1000).toISOString()
-      );
-
       await message.respond({
         message:
           "Урок уже отмечен как отменённый. Если нужно восстановить урок, напиши преподавателю напрямую.",
       });
 
       console.log(`Cancelled lesson ${lesson.id} kept unchanged after ready reply`);
-      return;
+      markTelegramMessageProcessed(storedMessage.id, student.id);
+      return "ignored";
     }
 
     db.prepare(
@@ -391,39 +548,32 @@ async function handleIncomingMessage(event: NewMessageEvent): Promise<void> {
       `
     ).run(lesson.id);
 
-    saveTelegramMessage(
-      student.id,
-      chatId,
-      message.id.toString(),
-      text,
-      new Date(message.date * 1000).toISOString()
-    );
-
     await message.respond({
       message: "Отлично, до встречи на уроке ✅",
     });
 
     console.log(`Lesson ${lesson.id} confirmed`);
-    return;
+    const payment = db
+      .prepare("SELECT id FROM payments WHERE lesson_id = ?")
+      .get(lesson.id) as { id: number } | undefined;
+    console.log("Listener is still running, waiting for PDF receipt", {
+      lessonId: lesson.id,
+      paymentId: payment?.id ?? null,
+    });
+    markTelegramMessageProcessed(storedMessage.id, student.id);
+    return "confirmed_lesson";
   }
 
   if (
     lesson.status === "cancelled_by_student" ||
     lesson.status === "cancelled_by_teacher"
   ) {
-    return;
+    markTelegramMessageProcessed(storedMessage.id, student.id);
+    return "ignored";
   }
 
   const lessonStartTime = Date.parse(lesson.start_time);
   const hoursUntilLesson = (lessonStartTime - Date.now()) / (60 * 60 * 1000);
-
-  saveTelegramMessage(
-    student.id,
-    chatId,
-    message.id.toString(),
-    text,
-    new Date(message.date * 1000).toISOString()
-  );
 
   if (hoursUntilLesson <= cancellationDeadlineHours) {
     await message.respond({
@@ -432,7 +582,8 @@ async function handleIncomingMessage(event: NewMessageEvent): Promise<void> {
     });
 
     console.log(`Cancellation rejected because deadline passed for lesson ${lesson.id}`);
-    return;
+    markTelegramMessageProcessed(storedMessage.id, student.id);
+    return "ignored";
   }
 
   db.prepare(
@@ -452,6 +603,55 @@ async function handleIncomingMessage(event: NewMessageEvent): Promise<void> {
   });
 
   console.log(`Lesson ${lesson.id} cancelled`);
+  markTelegramMessageProcessed(storedMessage.id, student.id);
+  return "cancelled_lesson";
+}
+
+async function safelyProcessTelegramMessage(
+  client: TelegramClient,
+  message: NewMessageEvent["message"],
+  source: ProcessingSource
+): Promise<ProcessingAction> {
+  try {
+    const action = await processTelegramMessage(client, message, source);
+    if (action !== "duplicate") {
+      const document = getMessageDocument(message);
+      console.log("Processed Telegram message", {
+        source,
+        chat_id: message.chatId?.toString() ?? null,
+        message_id: message.id.toString(),
+        sender_id: message.senderId?.toString() ?? null,
+        message_type: getMessageType(message, document),
+        action,
+      });
+    }
+    return action;
+  } catch (error) {
+    const chatId = message.chatId?.toString();
+    if (chatId) {
+      const row = db
+        .prepare(
+          `
+            SELECT id
+            FROM telegram_messages
+            WHERE telegram_chat_id = ?
+              AND telegram_message_id = ?
+          `
+        )
+        .get(chatId, message.id.toString()) as { id: number } | undefined;
+
+      if (row) {
+        markTelegramMessageError(row.id, error);
+      }
+    }
+
+    console.error("Failed to process Telegram message:", {
+      source,
+      message_id: message.id.toString(),
+      error: error instanceof Error ? error.message : "unknown error",
+    });
+    return "ignored";
+  }
 }
 
 function sleep(durationMs: number): Promise<void> {
@@ -464,7 +664,13 @@ export async function startTelegramListener(): Promise<void> {
   let lastReceivedMessageAt: string | null = null;
   let stopping = false;
   let activeHealthTimer: NodeJS.Timeout | null = null;
+  let activePollingTimer: NodeJS.Timeout | null = null;
   let resolveCurrentGeneration: (() => void) | null = null;
+  let lastPolledAt: string | null = null;
+  let lastPollingError: string | null = null;
+  let processedMessageCount = 0;
+  let skippedDuplicateCount = 0;
+  let isPolling = false;
 
   const stopListener = async (signal: NodeJS.Signals): Promise<void> => {
     if (stopping) {
@@ -480,6 +686,10 @@ export async function startTelegramListener(): Promise<void> {
     if (activeHealthTimer) {
       clearInterval(activeHealthTimer);
       activeHealthTimer = null;
+    }
+    if (activePollingTimer) {
+      clearInterval(activePollingTimer);
+      activePollingTimer = null;
     }
 
     if (activeClient) {
@@ -518,13 +728,100 @@ export async function startTelegramListener(): Promise<void> {
         (event) => {
           lastReceivedMessageAt = new Date().toISOString();
 
-          void handleIncomingMessage(event).catch((error) => {
-            console.error("Failed to handle Telegram message:");
-            console.error(error);
+          void safelyProcessTelegramMessage(client, event.message, "event").then(
+            (action) => {
+              if (action === "duplicate") {
+                skippedDuplicateCount += 1;
+              } else {
+                processedMessageCount += 1;
+              }
+            }
+          ).catch((error) => {
+            console.error("Failed to handle Telegram message:", error);
           });
         },
         new NewMessage({ incoming: true })
       );
+      console.log("telegramListener event handler attached", {
+        pid: process.pid,
+        generation,
+      });
+
+      const pollOnce = async (): Promise<void> => {
+        if (isPolling) {
+          console.log(
+            "telegramListener polling skipped because previous poll is still running"
+          );
+          return;
+        }
+
+        isPolling = true;
+        try {
+          const students = db
+            .prepare(
+              `
+                SELECT telegram_id, telegram_username
+                FROM students
+                WHERE is_active = 1
+                  AND (
+                    (telegram_id IS NOT NULL AND telegram_id != '')
+                    OR (telegram_username IS NOT NULL AND telegram_username != '')
+                  )
+              `
+            )
+            .all() as Array<{
+            telegram_id: string | null;
+            telegram_username: string | null;
+          }>;
+
+          for (const student of students) {
+            const target =
+              student.telegram_id?.trim() ||
+              student.telegram_username?.trim().replace(/^@/, "");
+
+            if (!target) {
+              continue;
+            }
+
+            const messages = await client.getMessages(target, {
+              limit: pollingLimit,
+            });
+
+            for (const message of [...messages].reverse()) {
+              const action = await safelyProcessTelegramMessage(
+                client,
+                message,
+                "polling"
+              );
+              if (action === "duplicate") {
+                skippedDuplicateCount += 1;
+              } else {
+                processedMessageCount += 1;
+              }
+            }
+          }
+
+          lastPolledAt = new Date().toISOString();
+          lastPollingError = null;
+        } catch (error) {
+          lastPollingError =
+            error instanceof Error ? error.message : "unknown error";
+          console.error("telegramListener polling failed", {
+            error: lastPollingError,
+          });
+        } finally {
+          isPolling = false;
+        }
+      };
+
+      await pollOnce();
+      activePollingTimer = setInterval(() => {
+        void pollOnce();
+      }, pollingIntervalMs);
+      console.log("telegramListener ready to receive messages", {
+        pid: process.pid,
+        generation,
+      });
 
       let failedHealthChecks = 0;
 
@@ -542,6 +839,10 @@ export async function startTelegramListener(): Promise<void> {
                 generation,
                 timestamp: new Date().toISOString(),
                 lastReceivedMessageAt,
+                lastPolledAt,
+                lastPollingError,
+                processedMessageCount,
+                skippedDuplicateCount,
               });
             } catch (error) {
               failedHealthChecks += 1;
@@ -556,6 +857,10 @@ export async function startTelegramListener(): Promise<void> {
                 if (activeHealthTimer) {
                   clearInterval(activeHealthTimer);
                   activeHealthTimer = null;
+                }
+                if (activePollingTimer) {
+                  clearInterval(activePollingTimer);
+                  activePollingTimer = null;
                 }
 
                 resolve();

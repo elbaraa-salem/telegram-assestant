@@ -13,14 +13,18 @@ if (!apiId || !apiHash || !phoneNumber) {
 }
 
 export async function getTelegramClient(
-  serviceName = "unknownService"
+  serviceName = "unknownService",
+  options: { sendOnly?: boolean } = {}
 ): Promise<TelegramClient> {
+  const sendOnly = options.sendOnly === true;
   const client = new TelegramClient(
     new StringSession(sessionString),
     apiId,
     apiHash,
     {
       connectionRetries: 5,
+      autoReconnect: !sendOnly,
+      reconnectRetries: sendOnly ? 0 : undefined,
     }
   );
 
@@ -28,7 +32,13 @@ export async function getTelegramClient(
     phoneNumber: async () => phoneNumber,
     password: async () => await input.text("Telegram 2FA password: "),
     phoneCode: async () => await input.text("Telegram code: "),
-    onError: (error) => console.error(error),
+    onError: (error) => {
+      if (sendOnly && error.message.includes("TIMEOUT")) {
+        return;
+      }
+
+      console.error(error);
+    },
   });
 
   console.log(`${serviceName} Telegram client connected`, {

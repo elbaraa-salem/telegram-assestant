@@ -38,7 +38,9 @@ async function sendStudentMessage(
   }
 
   try {
-    const client = await getTelegramClient("lessonCompletionService");
+    const client = await getTelegramClient("lessonCompletionService", {
+      sendOnly: true,
+    });
 
     try {
       await client.sendMessage(target, { message });

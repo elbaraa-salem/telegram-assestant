@@ -18,6 +18,8 @@ const stringSession = new StringSession(sessionString);
 
 const client = new TelegramClient(stringSession, apiId, apiHash, {
   connectionRetries: 5,
+  autoReconnect: false,
+  reconnectRetries: 0,
 });
 
 function toUnixTimestampInSeconds(date: Date): number {
@@ -29,7 +31,13 @@ async function main() {
     phoneNumber: async () => phoneNumber,
     password: async () => await input.text("Telegram 2FA password: "),
     phoneCode: async () => await input.text("Telegram code: "),
-    onError: (err) => console.error(err),
+    onError: (err) => {
+      if (err.message.includes("TIMEOUT")) {
+        return;
+      }
+
+      console.error(err);
+    },
   });
 
   console.log("sendTestMessage Telegram client connected", {

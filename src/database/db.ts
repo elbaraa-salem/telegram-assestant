@@ -1,7 +1,23 @@
 import Database from "better-sqlite3";
+import fs from "node:fs";
 import path from "path";
 
-const dbPath = path.join(process.cwd(), "data", "app.db");
+const dataDir = path.join(process.cwd(), "data");
+const dbPath = path.join(dataDir, "app.db");
+
+fs.mkdirSync(dataDir, { recursive: true });
+
+// If the main database was intentionally removed, stale sidecars from the old
+// database must not be reused for the fresh file.
+if (!fs.existsSync(dbPath)) {
+  for (const suffix of ["-wal", "-shm"]) {
+    const sidecarPath = `${dbPath}${suffix}`;
+
+    if (fs.existsSync(sidecarPath)) {
+      fs.rmSync(sidecarPath);
+    }
+  }
+}
 
 export const db = new Database(dbPath);
 
@@ -118,6 +134,13 @@ db.exec(`
     text TEXT,
 
     sent_at TEXT NOT NULL,
+    sender_id TEXT,
+    message_date TEXT,
+    has_media INTEGER NOT NULL DEFAULT 0,
+    media_type TEXT,
+    processed_at TEXT,
+    processing_status TEXT NOT NULL DEFAULT 'pending',
+    error TEXT,
 
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
@@ -145,6 +168,17 @@ db.exec(`
     FOREIGN KEY (lesson_id) REFERENCES lessons(id),
     FOREIGN KEY (student_id) REFERENCES students(id)
   );
+`);
+
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_lessons_google_event_id
+    ON lessons(google_event_id);
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_lesson_id
+    ON payments(lesson_id);
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_messages_chat_message
+    ON telegram_messages(telegram_chat_id, telegram_message_id);
 `);
 
 function addColumnIfMissing(sql: string): void {
@@ -182,6 +216,17 @@ addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response TEXT");
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response_at TEXT");
 addColumnIfMissing("ALTER TABLE payments ADD COLUMN prepaid_package_id INTEGER");
 addColumnIfMissing("ALTER TABLE payments ADD COLUMN payment_method TEXT");
+addColumnIfMissing("ALTER TABLE telegram_messages ADD COLUMN sender_id TEXT");
+addColumnIfMissing("ALTER TABLE telegram_messages ADD COLUMN message_date TEXT");
+addColumnIfMissing(
+  "ALTER TABLE telegram_messages ADD COLUMN has_media INTEGER NOT NULL DEFAULT 0"
+);
+addColumnIfMissing("ALTER TABLE telegram_messages ADD COLUMN media_type TEXT");
+addColumnIfMissing("ALTER TABLE telegram_messages ADD COLUMN processed_at TEXT");
+addColumnIfMissing(
+  "ALTER TABLE telegram_messages ADD COLUMN processing_status TEXT NOT NULL DEFAULT 'pending'"
+);
+addColumnIfMissing("ALTER TABLE telegram_messages ADD COLUMN error TEXT");
 addPaymentColumnIfMissing("receipt_text", "receipt_text TEXT");
 addPaymentColumnIfMissing("ai_amount", "ai_amount REAL");
 addPaymentColumnIfMissing("ai_currency", "ai_currency TEXT");

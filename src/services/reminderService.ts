@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { db } from "../database/db";
 import { getTelegramClient } from "./telegramClient";
+import { resolveMissingTelegramIds } from "./telegramIdentityService";
 
 type ReminderLesson = {
   lesson_id: number;
@@ -38,6 +39,10 @@ function cleanUsername(username: string): string {
 }
 
 function getReminderTarget(lesson: ReminderLesson): string | null {
+  if (lesson.telegram_id?.trim()) {
+    return lesson.telegram_id.trim();
+  }
+
   if (lesson.telegram_username?.trim()) {
     return cleanUsername(lesson.telegram_username);
   }
@@ -63,7 +68,7 @@ function buildReminderMessage(lesson: ReminderLesson): string {
 
 Напоминаю: завтра у нас урок в ${time}.
 
-Ответь, пожалуйста:
+Ответь, пожалуйста(цефрами):
 1 — да, я готов
 2 — нет, нужно отменить`;
 }
@@ -73,6 +78,10 @@ export async function sendLessonReminders(): Promise<ReminderResult> {
   const lookaheadHours = getPositiveNumberEnv("REMINDER_LOOKAHEAD_HOURS", 24);
   const lookaheadUntil = now + lookaheadHours * 60 * 60 * 1000;
   const dryRun = isDryRun();
+
+  if (!dryRun) {
+    await resolveMissingTelegramIds();
+  }
 
   const lessons = db
     .prepare(
@@ -141,7 +150,9 @@ export async function sendLessonReminders(): Promise<ReminderResult> {
     `
   );
 
-  const client = await getTelegramClient("reminderService");
+  const client = await getTelegramClient("reminderService", {
+    sendOnly: true,
+  });
 
   try {
     for (const lesson of lessonsToSend) {
