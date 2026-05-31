@@ -32,6 +32,12 @@
 
     <dt>Skipped protected</dt>
     <dd><%= calendar.lastSkippedProtectedLessons %></dd>
+
+    <dt>Deleted untouched</dt>
+    <dd><%= calendar.lastDeletedUntouchedLessons %></dd>
+
+    <dt>Preserved deleted events</dt>
+    <dd><%= calendar.lastPreservedDeletedCalendarLessons %></dd>
   </dl>
 
   <form method="post" action="/calendar/sync">

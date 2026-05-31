@@ -1,5 +1,8 @@
 <section class="page-header">
   <h1>Students</h1>
+  <% if (warning) { %>
+    <div class="notice notice-warning"><%= warning %></div>
+  <% } %>
 </section>
 
 <section class="form-grid">
@@ -66,6 +69,7 @@
       <!-- <th>Created</th> -->
       <th>Debt</th>
       <th>Prepaid balance</th>
+      <th>Welcome</th>
       <th>Actions</th>
     </tr>
   </thead>
@@ -89,11 +93,27 @@
           <%= student.balance.prepaid_lessons_count %> lessons<br>
           <%= student.balance.prepaid_amount %> <%= student.balance.currency %>
         </td>
+        <td>
+          <% if (student.welcome_message_sent_at) { %>
+            Sent<br>
+            <%= student.welcome_message_sent_at %>
+          <% } else if (student.welcome_message_error) { %>
+            Failed<br>
+            <%= student.welcome_message_error %>
+          <% } else { %>
+            Not sent
+          <% } %>
+        </td>
         <td class="actions">
           <a class="button button-secondary" href="/students/<%= student.id %>/edit">Edit</a>
           <form method="post" action="/students/<%= student.id %>/sync-calendar">
             <button class="button" type="submit">Sync calendar</button>
           </form>
+          <% if (!student.welcome_message_sent_at) { %>
+            <form method="post" action="/students/<%= student.id %>/send-welcome">
+              <button class="button" type="submit">Send welcome message</button>
+            </form>
+          <% } %>
         </td>
       </tr>
     <% }) %>

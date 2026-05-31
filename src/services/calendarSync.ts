@@ -40,6 +40,25 @@ type ExistingLesson = {
   google_status: string | null;
 };
 
+type LocalSyncedLesson = {
+  id: number;
+  google_event_id: string;
+  status: string;
+  reminder_sent: number;
+  payment_request_sent: number;
+  student_response: string | null;
+  student_response_at: string | null;
+  cancellation_source: string | null;
+  awaiting_cancellation_reason: number;
+  cancellation_reason: string | null;
+  cancellation_requested_at: string | null;
+  cancellation_confirmed_at: string | null;
+  ai_cancellation_confidence: number | null;
+  charge_count: number;
+  payment_count: number;
+  allocation_count: number;
+};
+
 type MatchedEventDetail = {
   eventId: string;
   title: string;
@@ -61,6 +80,8 @@ type SyncResult = {
   insertedLessons: number;
   updatedLessons: number;
   skippedProtectedLessons: number;
+  deletedUntouchedLessons: number;
+  preservedDeletedCalendarLessons: number;
   createdPayments: number;
   dryRun: boolean;
   wouldInsertLessons: number;
@@ -92,6 +113,8 @@ export type CalendarRuntimeStatus = {
   lastInsertedLessons: number;
   lastUpdatedLessons: number;
   lastSkippedProtectedLessons: number;
+  lastDeletedUntouchedLessons: number;
+  lastPreservedDeletedCalendarLessons: number;
 };
 
 export type SyncCalendarOptions = {
@@ -350,6 +373,14 @@ function saveCalendarSyncStatus(
     "calendar.last_skipped_protected_lessons",
     String(result?.skippedProtectedLessons ?? 0)
   );
+  setSetting(
+    "calendar.last_deleted_untouched_lessons",
+    String(result?.deletedUntouchedLessons ?? 0)
+  );
+  setSetting(
+    "calendar.last_preserved_deleted_calendar_lessons",
+    String(result?.preservedDeletedCalendarLessons ?? 0)
+  );
 }
 
 export function getCalendarRuntimeStatus(): CalendarRuntimeStatus {
@@ -365,7 +396,42 @@ export function getCalendarRuntimeStatus(): CalendarRuntimeStatus {
     lastSkippedProtectedLessons: Number(
       getSetting("calendar.last_skipped_protected_lessons") ?? 0
     ),
+    lastDeletedUntouchedLessons: Number(
+      getSetting("calendar.last_deleted_untouched_lessons") ?? 0
+    ),
+    lastPreservedDeletedCalendarLessons: Number(
+      getSetting("calendar.last_preserved_deleted_calendar_lessons") ?? 0
+    ),
   };
+}
+
+function eventIsActive(event: calendar_v3.Schema$Event): boolean {
+  return Boolean(
+    event.id &&
+      event.status !== "cancelled" &&
+      event.summary?.trim() &&
+      getEventTime(event.start) &&
+      getEventTime(event.end)
+  );
+}
+
+function lessonIsUntouched(lesson: LocalSyncedLesson): boolean {
+  return (
+    lesson.status === "scheduled" &&
+    lesson.reminder_sent === 0 &&
+    lesson.payment_request_sent === 0 &&
+    !lesson.student_response &&
+    !lesson.student_response_at &&
+    !lesson.cancellation_source &&
+    lesson.awaiting_cancellation_reason === 0 &&
+    !lesson.cancellation_reason &&
+    !lesson.cancellation_requested_at &&
+    !lesson.cancellation_confirmed_at &&
+    lesson.ai_cancellation_confidence === null &&
+    lesson.charge_count === 0 &&
+    lesson.payment_count === 0 &&
+    lesson.allocation_count === 0
+  );
 }
 
 export async function testCalendarConnection(): Promise<boolean> {
@@ -442,6 +508,47 @@ export async function syncCalendarLessons(
       WHERE id = ?
     `
   );
+  const findLocalSyncedLessonsInWindow = db.prepare(
+    `
+      SELECT
+        lessons.id,
+        lessons.google_event_id,
+        lessons.status,
+        lessons.reminder_sent,
+        lessons.payment_request_sent,
+        lessons.student_response,
+        lessons.student_response_at,
+        lessons.cancellation_source,
+        lessons.awaiting_cancellation_reason,
+        lessons.cancellation_reason,
+        lessons.cancellation_requested_at,
+        lessons.cancellation_confirmed_at,
+        lessons.ai_cancellation_confidence,
+        COUNT(DISTINCT lesson_charges.id) AS charge_count,
+        COUNT(DISTINCT direct_payments.id) AS payment_count,
+        COUNT(DISTINCT payment_allocations.id) AS allocation_count
+      FROM lessons
+      LEFT JOIN lesson_charges ON lesson_charges.lesson_id = lessons.id
+      LEFT JOIN payments AS direct_payments ON direct_payments.lesson_id = lessons.id
+      LEFT JOIN payment_allocations
+        ON payment_allocations.lesson_charge_id = lesson_charges.id
+      WHERE lessons.google_event_id IS NOT NULL
+        AND lessons.google_event_id != ''
+        AND datetime(lessons.start_time) >= datetime(?)
+        AND datetime(lessons.start_time) <= datetime(?)
+      GROUP BY lessons.id
+    `
+  );
+  const deleteLesson = db.prepare("DELETE FROM lessons WHERE id = ?");
+  const markLessonGoogleDeleted = db.prepare(
+    `
+      UPDATE lessons
+      SET google_status = 'deleted',
+          google_deleted_at = COALESCE(google_deleted_at, datetime('now')),
+          updated_at = datetime('now')
+      WHERE id = ?
+    `
+  );
 
   const result: SyncResult = {
     timeMin: syncWindow.timeMin,
@@ -451,6 +558,8 @@ export async function syncCalendarLessons(
     insertedLessons: 0,
     updatedLessons: 0,
     skippedProtectedLessons: 0,
+    deletedUntouchedLessons: 0,
+    preservedDeletedCalendarLessons: 0,
     createdPayments: 0,
     dryRun,
     wouldInsertLessons: 0,
@@ -461,6 +570,12 @@ export async function syncCalendarLessons(
   };
 
   const events = options.events ?? (await listUpcomingEvents(calendar!, syncWindow));
+  const activeGoogleEventIds = new Set(
+    events
+      .filter(eventIsActive)
+      .map((event) => event.id)
+      .filter((eventId): eventId is string => Boolean(eventId))
+  );
   result.scannedEvents = events.length;
 
   const maxLessonsPerStudent = getPositiveIntegerEnv(
@@ -620,6 +735,38 @@ export async function syncCalendarLessons(
       for (const event of calendarEvents) {
         syncEvent(event);
       }
+
+      const localSyncedLessons = findLocalSyncedLessonsInWindow.all(
+        syncWindow.timeMin,
+        syncWindow.timeMax
+      ) as LocalSyncedLesson[];
+
+      for (const lesson of localSyncedLessons) {
+        if (activeGoogleEventIds.has(lesson.google_event_id)) {
+          continue;
+        }
+
+        if (lessonIsUntouched(lesson)) {
+          deleteLesson.run(lesson.id);
+          result.deletedUntouchedLessons += 1;
+          console.log("calendar event deleted; untouched local lesson removed", {
+            lessonId: lesson.id,
+            googleEventId: lesson.google_event_id,
+          });
+          continue;
+        }
+
+        markLessonGoogleDeleted.run(lesson.id);
+        result.preservedDeletedCalendarLessons += 1;
+        console.log(
+          "calendar event deleted; local lesson preserved because it has local state",
+          {
+            lessonId: lesson.id,
+            googleEventId: lesson.google_event_id,
+            status: lesson.status,
+          }
+        );
+      }
     });
 
     syncEvents(events);
@@ -632,6 +779,8 @@ export async function syncCalendarLessons(
     insertedLessons: result.insertedLessons,
     updatedLessons: result.updatedLessons,
     skippedProtectedLessons: result.skippedProtectedLessons,
+    deletedUntouchedLessons: result.deletedUntouchedLessons,
+    preservedDeletedCalendarLessons: result.preservedDeletedCalendarLessons,
   });
 
   return result;

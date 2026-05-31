@@ -69,6 +69,7 @@ db.exec(`
     cancellation_confirmed_at TEXT,
     cancellation_confirmed_by TEXT DEFAULT 'admin',
     ai_cancellation_confidence REAL,
+    google_deleted_at TEXT,
 
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL,
@@ -435,12 +436,16 @@ addColumnIfMissing("ALTER TABLE lessons ADD COLUMN cancellation_confirmed_at TEX
 addColumnIfMissing(
   "ALTER TABLE lessons ADD COLUMN cancellation_confirmed_by TEXT DEFAULT 'admin'"
 );
+addColumnIfMissing("ALTER TABLE lessons ADD COLUMN google_deleted_at TEXT");
 addColumnIfMissing(
   "ALTER TABLE students ADD COLUMN lesson_price_amount INTEGER NOT NULL DEFAULT 0"
 );
 addColumnIfMissing(
   "ALTER TABLE students ADD COLUMN lesson_price_currency TEXT NOT NULL DEFAULT 'RUB'"
 );
+addColumnIfMissing("ALTER TABLE students ADD COLUMN welcome_message_sent_at TEXT");
+addColumnIfMissing("ALTER TABLE students ADD COLUMN welcome_message_id TEXT");
+addColumnIfMissing("ALTER TABLE students ADD COLUMN welcome_message_error TEXT");
 addColumnIfMissing("ALTER TABLE payments ADD COLUMN prepaid_package_id INTEGER");
 addColumnIfMissing("ALTER TABLE payments ADD COLUMN payment_method TEXT");
 addColumnIfMissing("ALTER TABLE telegram_messages ADD COLUMN sender_id TEXT");

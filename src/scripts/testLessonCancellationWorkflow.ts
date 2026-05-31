@@ -107,6 +107,7 @@ function insertLesson(input: {
   status?: string;
   cancellationReason?: string | null;
   cancellationRequestedAt?: string | null;
+  startModifier?: string;
 }): number {
   return Number(
     db
@@ -123,12 +124,14 @@ function insertLesson(input: {
             cancellation_requested_at,
             updated_at
           )
-          VALUES (?, ?, 'Cancellation workflow lesson', datetime('now', '+1 day'), datetime('now', '+1 day', '+1 hour'), ?, ?, ?, datetime('now'))
+          VALUES (?, ?, 'Cancellation workflow lesson', datetime('now', ?), datetime('now', ?, '+1 hour'), ?, ?, ?, datetime('now'))
         `
       )
       .run(
         input.eventId,
         input.studentId ?? studentId,
+        input.startModifier ?? "+1 day",
+        input.startModifier ?? "+1 day",
         input.status ?? "scheduled",
         input.cancellationReason ?? null,
         input.cancellationRequestedAt ?? null
@@ -147,6 +150,24 @@ const cancelledLessonId = insertLesson({
   eventId: "already-cancelled-test",
   status: "cancelled",
 });
+const oldHiddenLessonId = insertLesson({
+  eventId: "old-hidden-test",
+  startModifier: "-10 days",
+});
+const futureHiddenLessonId = insertLesson({
+  eventId: "future-hidden-test",
+  startModifier: "+10 days",
+});
+const completedVisibleLessonId = insertLesson({
+  eventId: "completed-visible-test",
+  status: "completed",
+  startModifier: "-1 day",
+});
+const cancelledVisibleLessonId = insertLesson({
+  eventId: "cancelled-visible-test",
+  status: "cancelled",
+  startModifier: "+1 day",
+});
 
 const server = spawn(tsxPath, [serverPath], {
   cwd: tempDir,
@@ -157,6 +178,7 @@ const server = spawn(tsxPath, [serverPath], {
     TG_API_HASH: process.env.TG_API_HASH ?? "test-api-hash",
     TG_PHONE: process.env.TG_PHONE ?? "+10000000000",
     MANAGE_SPEND_BOT_NOTIFICATIONS_ENABLED: "false",
+    STUDENT_WELCOME_MESSAGE_ENABLED: "false",
   },
 });
 
@@ -277,6 +299,31 @@ try {
     lessonsHtml,
     /University exam/,
     "student cancellation reason should be visible"
+  );
+  assert.match(
+    lessonsHtml,
+    /Showing lessons from \d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}/,
+    "default lessons page should show selected date range text"
+  );
+  assert.doesNotMatch(
+    lessonsHtml,
+    new RegExp(`<td>${oldHiddenLessonId}</td>`),
+    "lessons before previous 7 days should be hidden by default"
+  );
+  assert.doesNotMatch(
+    lessonsHtml,
+    new RegExp(`<td>${futureHiddenLessonId}</td>`),
+    "lessons after next 7 days should be hidden by default"
+  );
+  assert.match(
+    lessonsHtml,
+    new RegExp(`<td>${completedVisibleLessonId}</td>`),
+    "completed lessons inside range should be shown"
+  );
+  assert.match(
+    lessonsHtml,
+    new RegExp(`<td>${cancelledVisibleLessonId}</td>`),
+    "cancelled lessons inside range should be shown"
   );
 
   const requestedCancelHtml = await (

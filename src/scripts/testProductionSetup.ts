@@ -168,6 +168,129 @@ try {
     },
   ]);
 
+  const insertLocalLesson = (input: {
+    googleEventId: string;
+    status?: string;
+    startTime?: string;
+    reminderSent?: number;
+  }): number =>
+    Number(
+      db
+        .prepare(
+          `
+            INSERT INTO lessons (
+              google_event_id,
+              student_id,
+              title,
+              start_time,
+              end_time,
+              status,
+              google_status,
+              reminder_sent,
+              updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'confirmed', ?, datetime('now'))
+          `
+        )
+        .run(
+          input.googleEventId,
+          studentId,
+          input.googleEventId,
+          input.startTime ?? "2026-06-05T10:00:00+07:00",
+          "2026-06-05T11:00:00+07:00",
+          input.status ?? "scheduled",
+          input.reminderSent ?? 0
+        ).lastInsertRowid
+    );
+
+  const untouchedLessonId = insertLocalLesson({ googleEventId: "delete-me" });
+  const completedMissingLessonId = insertLocalLesson({
+    googleEventId: "missing-completed",
+    status: "completed",
+  });
+  const cancelledMissingLessonId = insertLocalLesson({
+    googleEventId: "missing-cancelled",
+    status: "cancelled",
+  });
+  const remindedMissingLessonId = insertLocalLesson({
+    googleEventId: "missing-reminded",
+    reminderSent: 1,
+  });
+  const chargedMissingLessonId = insertLocalLesson({
+    googleEventId: "missing-charged",
+  });
+  const activeUnrelatedLessonId = insertLocalLesson({
+    googleEventId: "still-in-calendar",
+  });
+  const outsideRangeLessonId = insertLocalLesson({
+    googleEventId: "outside-range",
+    startTime: "2026-08-15T10:00:00+07:00",
+  });
+
+  db.prepare(
+    `
+      INSERT INTO lesson_charges (
+        lesson_id,
+        student_id,
+        charge_type,
+        amount,
+        currency,
+        status,
+        paid_amount,
+        updated_at
+      )
+      VALUES (?, ?, 'lesson', 1000, 'RUB', 'unpaid', 0, datetime('now'))
+    `
+  ).run(chargedMissingLessonId, studentId);
+
+  const deletedEventResult = await syncCalendarLessons({
+    events: [
+      {
+        id: "calendar-event-1",
+        summary: "prod-key lesson",
+        status: "confirmed",
+        start: { dateTime: "2026-06-02T10:00:00+07:00" },
+        end: { dateTime: "2026-06-02T11:00:00+07:00" },
+      },
+      {
+        id: "still-in-calendar",
+        summary: "prod-key lesson",
+        status: "confirmed",
+        start: { dateTime: "2026-06-05T10:00:00+07:00" },
+        end: { dateTime: "2026-06-05T11:00:00+07:00" },
+      },
+    ],
+  });
+
+  assert.equal(deletedEventResult.deletedUntouchedLessons, 1);
+  assert.ok(deletedEventResult.preservedDeletedCalendarLessons >= 4);
+  assert.equal(
+    (
+      db
+        .prepare("SELECT COUNT(*) AS count FROM lessons WHERE id = ?")
+        .get(untouchedLessonId) as { count: number }
+    ).count,
+    0
+  );
+
+  for (const lessonId of [
+    completedMissingLessonId,
+    cancelledMissingLessonId,
+    remindedMissingLessonId,
+    chargedMissingLessonId,
+    activeUnrelatedLessonId,
+    outsideRangeLessonId,
+  ]) {
+    assert.equal(
+      (
+        db
+          .prepare("SELECT COUNT(*) AS count FROM lessons WHERE id = ?")
+          .get(lessonId) as { count: number }
+      ).count,
+      1
+    );
+  }
+
   console.log("Production setup checks passed.");
 } finally {
   db.close();

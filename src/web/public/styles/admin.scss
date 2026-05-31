@@ -357,6 +357,33 @@ fieldset {
   }
 }
 
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: end;
+  margin: 0 0 16px;
+
+  .button,
+  button {
+    margin-top: 0;
+    text-decoration: none;
+  }
+}
+
+.inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: end;
+
+  input {
+    width: auto;
+    min-width: 150px;
+    margin-top: 0;
+  }
+}
+
 .ai-receipt {
   color: var(--text-soft);
   line-height: 1.45;

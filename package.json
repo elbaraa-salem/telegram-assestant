@@ -28,6 +28,7 @@
     "test:lesson-cancellation": "tsx src/scripts/testLessonCancellationWorkflow.ts",
     "test:manage-spend-notifier": "tsx src/scripts/testManageSpendNotifier.ts",
     "test:production-setup": "tsx src/scripts/testProductionSetup.ts",
+    "test:student-welcome": "tsx src/scripts/testStudentWelcome.ts",
     "test:receipt-idempotency": "tsx src/scripts/testReceiptIdempotency.ts",
     "test:pdf-text": "tsx src/scripts/extractReceiptText.ts",
     "test:receipt-ai": "NODE_OPTIONS=--dns-result-order=ipv4first tsx src/scripts/analyzeReceiptWithAi.ts",

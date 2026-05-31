@@ -16,6 +16,7 @@ import {
   syncCalendarLessons,
   testCalendarConnection,
 } from "../services/calendarSync";
+import { sendStudentWelcomeMessage } from "../services/studentWelcomeService";
 
 const app = express();
 const port = Number(process.env.ADMIN_PORT ?? 3000);
@@ -32,6 +33,9 @@ type Student = {
   created_at: string;
   lesson_price_amount: number;
   lesson_price_currency: string;
+  welcome_message_sent_at: string | null;
+  welcome_message_id: string | null;
+  welcome_message_error: string | null;
 };
 
 type LessonRow = {
@@ -174,6 +178,63 @@ function formatLessonStartTime(startTime: string): {
   };
 }
 
+function formatDateInput(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+function addDays(date: Date, days: number): Date {
+  const nextDate = new Date(date);
+  nextDate.setUTCDate(nextDate.getUTCDate() + days);
+  return nextDate;
+}
+
+function getAdminLessonsRange(query: Record<string, unknown>): {
+  fromDate: string | null;
+  toDate: string | null;
+  label: string;
+  mode: string;
+} {
+  const today = new Date();
+  const pastDays = Number(process.env.LESSONS_ADMIN_PAST_DAYS ?? 7);
+  const futureDays = Number(process.env.LESSONS_ADMIN_FUTURE_DAYS ?? 7);
+  const safePastDays =
+    Number.isFinite(pastDays) && pastDays >= 0 ? Math.round(pastDays) : 7;
+  const safeFutureDays =
+    Number.isFinite(futureDays) && futureDays >= 0 ? Math.round(futureDays) : 7;
+  const mode = String(query.range ?? "current");
+
+  if (mode === "all-future") {
+    return {
+      fromDate: formatDateInput(today),
+      toDate: null,
+      label: "all future lessons",
+      mode,
+    };
+  }
+
+  if (mode === "custom") {
+    const fromDate = String(query.from ?? "").trim() || null;
+    const toDate = String(query.to ?? "").trim() || null;
+
+    return {
+      fromDate,
+      toDate,
+      label: "custom range",
+      mode,
+    };
+  }
+
+  const offset = mode === "previous" ? -7 : mode === "next" ? 7 : 0;
+  const anchorDate = addDays(today, offset);
+
+  return {
+    fromDate: formatDateInput(addDays(anchorDate, -safePastDays)),
+    toDate: formatDateInput(addDays(anchorDate, safeFutureDays)),
+    label: mode === "previous" ? "previous week" : mode === "next" ? "next week" : "current range",
+    mode: mode === "previous" || mode === "next" ? mode : "current",
+  };
+}
+
 function normalizeTelegramUsername(value: string): string {
   const trimmed = value.trim();
 
@@ -198,7 +259,10 @@ function getStudentById(studentId: number): Student | undefined {
           students.is_active,
           students.created_at,
           students.lesson_price_amount,
-          students.lesson_price_currency
+          students.lesson_price_currency,
+          students.welcome_message_sent_at,
+          students.welcome_message_id,
+          students.welcome_message_error
         FROM students
         WHERE students.id = ?
       `
@@ -293,7 +357,10 @@ app.get("/students", (_request, response) => {
           students.is_active,
           students.created_at,
           students.lesson_price_amount,
-          students.lesson_price_currency
+          students.lesson_price_currency,
+          students.welcome_message_sent_at,
+          students.welcome_message_id,
+          students.welcome_message_error
         FROM students
         ORDER BY students.id
       `
@@ -308,10 +375,11 @@ app.get("/students", (_request, response) => {
     title: "Students",
     page: "students",
     students: viewStudents,
+    warning: String(_request.query.warning ?? ""),
   });
 });
 
-app.post("/students", (request, response) => {
+app.post("/students", async (request, response) => {
   const input = getStudentFormInput(request.body);
 
   if (!isValidStudentInput(input)) {
@@ -323,7 +391,7 @@ app.post("/students", (request, response) => {
     return;
   }
 
-  db.prepare(
+  const insertResult = db.prepare(
     `
       INSERT INTO students (
         name_ru,
@@ -347,6 +415,7 @@ app.post("/students", (request, response) => {
     Math.round(input.lessonPriceAmount),
     input.lessonPriceCurrency
   );
+  const studentId = Number(insertResult.lastInsertRowid);
 
   console.log("student created", {
     nameRu: input.nameRu,
@@ -365,6 +434,52 @@ app.post("/students", (request, response) => {
       ? "telegram_id provided manually"
       : "telegram_id will be resolved from Telegram username or first message",
   });
+
+  const welcomeResult = await sendStudentWelcomeMessage(studentId);
+
+  if (welcomeResult.status === "failed") {
+    response.redirect(
+      `/students?warning=${encodeURIComponent(
+        "Student was created, but Telegram ID could not be resolved, so welcome message was not sent."
+      )}`
+    );
+    return;
+  }
+
+  response.redirect("/students");
+});
+
+app.post("/students/:id/send-welcome", async (request, response) => {
+  const studentId = Number(request.params.id);
+
+  if (!Number.isInteger(studentId) || studentId <= 0) {
+    response.status(400).render("layout", {
+      title: "Invalid student",
+      page: "error",
+      message: "Invalid student ID.",
+    });
+    return;
+  }
+
+  const student = getStudentById(studentId);
+
+  if (!student) {
+    renderStudentNotFound(response);
+    return;
+  }
+
+  const welcomeResult = await sendStudentWelcomeMessage(studentId, {
+    manual: true,
+  });
+
+  if (welcomeResult.status === "failed") {
+    response.redirect(
+      `/students?warning=${encodeURIComponent(
+        "Welcome message was not sent: " + welcomeResult.error
+      )}`
+    );
+    return;
+  }
 
   response.redirect("/students");
 });
@@ -697,7 +812,8 @@ app.post("/calendar/sync", async (_request, response) => {
   }
 });
 
-app.get("/lessons", (_request, response) => {
+app.get("/lessons", (request, response) => {
+  const range = getAdminLessonsRange(request.query);
   const lessons = db
     .prepare(
       `
@@ -739,11 +855,18 @@ app.get("/lessons", (_request, response) => {
             ORDER BY payments.paid_at DESC, payments.id DESC
             LIMIT 1
           )
+        WHERE (? IS NULL OR date(lessons.start_time) >= date(?))
+          AND (? IS NULL OR date(lessons.start_time) <= date(?))
         GROUP BY lessons.id
         ORDER BY lessons.start_time DESC
       `
     )
-    .all() as LessonRow[];
+    .all(
+      range.fromDate,
+      range.fromDate,
+      range.toDate,
+      range.toDate
+    ) as LessonRow[];
 
   const viewLessons = lessons.map((lesson) => ({
     ...lesson,
@@ -767,6 +890,7 @@ app.get("/lessons", (_request, response) => {
     title: "Lessons",
     page: "lessons",
     lessons: viewLessons,
+    range,
   });
 });
 

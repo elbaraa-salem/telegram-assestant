@@ -1,5 +1,21 @@
 <section class="page-header">
   <h1>Lessons</h1>
+  <p class="help-text">
+    Showing lessons from <%= range.fromDate || "any date" %> to <%= range.toDate || "future" %>
+  </p>
+</section>
+
+<section class="toolbar">
+  <a class="button button-secondary" href="/lessons?range=previous">Previous week</a>
+  <a class="button button-secondary" href="/lessons">Current range</a>
+  <a class="button button-secondary" href="/lessons?range=next">Next week</a>
+  <a class="button button-secondary" href="/lessons?range=all-future">Show all future</a>
+  <form class="inline-form" method="get" action="/lessons">
+    <input type="hidden" name="range" value="custom">
+    <input name="from" type="date" value="<%= range.fromDate || "" %>">
+    <input name="to" type="date" value="<%= range.toDate || "" %>">
+    <button class="button" type="submit">Custom date range</button>
+  </form>
 </section>
 
 <table class="table">
