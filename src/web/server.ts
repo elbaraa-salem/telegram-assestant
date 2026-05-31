@@ -11,6 +11,11 @@ import {
   createManualCharge,
   getStudentBalanceSummary,
 } from "../services/paymentBalanceService";
+import {
+  getCalendarRuntimeStatus,
+  syncCalendarLessons,
+  testCalendarConnection,
+} from "../services/calendarSync";
 
 const app = express();
 const port = Number(process.env.ADMIN_PORT ?? 3000);
@@ -343,7 +348,60 @@ app.post("/students", (request, response) => {
     input.lessonPriceCurrency
   );
 
+  console.log("student created", {
+    nameRu: input.nameRu,
+    nameAr: input.nameAr,
+    telegramUsername: input.telegramUsername || null,
+    telegramId: input.telegramId,
+    calendarKeyword: input.calendarKeyword,
+    lessonPriceAmount: Math.round(input.lessonPriceAmount),
+    lessonPriceCurrency: input.lessonPriceCurrency,
+  });
+  console.log("telegram id resolution result", {
+    calendarKeyword: input.calendarKeyword,
+    telegramId: input.telegramId,
+    resolved: Boolean(input.telegramId),
+    note: input.telegramId
+      ? "telegram_id provided manually"
+      : "telegram_id will be resolved from Telegram username or first message",
+  });
+
   response.redirect("/students");
+});
+
+app.post("/students/:id/sync-calendar", async (request, response) => {
+  const studentId = Number(request.params.id);
+
+  if (!Number.isInteger(studentId) || studentId <= 0) {
+    response.status(400).render("layout", {
+      title: "Invalid student",
+      page: "error",
+      message: "Invalid student ID.",
+    });
+    return;
+  }
+
+  const student = getStudentById(studentId);
+
+  if (!student) {
+    renderStudentNotFound(response);
+    return;
+  }
+
+  try {
+    await syncCalendarLessons({ studentId });
+    response.redirect("/calendar");
+  } catch (error) {
+    console.error("student calendar sync failed", {
+      studentId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    response.status(500).render("layout", {
+      title: "Calendar sync failed",
+      page: "error",
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
 app.get("/students/:id/edit", (request, response) => {
@@ -598,6 +656,45 @@ app.post("/packages", (request, response) => {
   );
 
   response.redirect("/students");
+});
+
+app.get("/calendar", async (_request, response) => {
+  const status = getCalendarRuntimeStatus();
+  let connected = status.connected;
+  let connectionError: string | null = null;
+
+  try {
+    connected = await testCalendarConnection();
+  } catch (error) {
+    connected = false;
+    connectionError = error instanceof Error ? error.message : String(error);
+  }
+
+  response.render("layout", {
+    title: "Calendar",
+    page: "calendar",
+    calendar: {
+      ...status,
+      connected,
+      connectionError,
+    },
+  });
+});
+
+app.post("/calendar/sync", async (_request, response) => {
+  try {
+    await syncCalendarLessons();
+    response.redirect("/calendar");
+  } catch (error) {
+    console.error("calendar sync failed from admin", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    response.status(500).render("layout", {
+      title: "Calendar sync failed",
+      page: "error",
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
 app.get("/lessons", (_request, response) => {
@@ -921,5 +1018,12 @@ app.post("/manual-debts", (request, response) => {
 });
 
 app.listen(port, () => {
+  console.log("app mode", {
+    appMode: process.env.APP_MODE?.trim() || "development",
+  });
+  console.log("test seed enabled/disabled", {
+    enabled:
+      String(process.env.ENABLE_TEST_SEED ?? "false").toLowerCase() === "true",
+  });
   console.log(`Admin server listening on http://localhost:${port}`);
 });

@@ -3,6 +3,7 @@ dist
 .env
 google-token.json
 google-credentials.json
+config/client_secret_1074832105156-1b3m0uccld6lv74n5m8id70s844vanhr.apps.googleusercontent.com.json
 config/google-credentials.json
 config/google-token.json
 *.session

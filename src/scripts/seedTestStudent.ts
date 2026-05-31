@@ -1,6 +1,16 @@
 import "dotenv/config";
 import { db } from "../database/db";
 
+const appMode = process.env.APP_MODE?.trim() || "development";
+const testSeedEnabled =
+  String(process.env.ENABLE_TEST_SEED ?? "false").toLowerCase() === "true";
+
+if (appMode === "production" || !testSeedEnabled) {
+  throw new Error(
+    "Test student seeding is disabled. Set ENABLE_TEST_SEED=true outside production to run this script."
+  );
+}
+
 type Student = {
   id: number;
   name_ru: string;

@@ -3,13 +3,42 @@ import path from "node:path";
 import { db } from "../database/db";
 
 const tables = [
+  "payment_allocations",
+  "lesson_charges",
   "payments",
   "lessons",
   "telegram_messages",
   "lesson_cancellation_analysis",
   "lesson_packages",
   "students",
+  "app_settings",
 ] as const;
+
+function createDatabaseBackup(): string | null {
+  const dataDir = path.join(process.cwd(), "data");
+  const dbPath = path.join(dataDir, "app.db");
+
+  if (!fs.existsSync(dbPath)) {
+    return null;
+  }
+
+  const backupDir = path.join(dataDir, "backups");
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backupBasePath = path.join(backupDir, `app-${timestamp}.db`);
+
+  fs.mkdirSync(backupDir, { recursive: true });
+  fs.copyFileSync(dbPath, backupBasePath);
+
+  for (const suffix of ["-wal", "-shm"]) {
+    const sidecarPath = `${dbPath}${suffix}`;
+
+    if (fs.existsSync(sidecarPath)) {
+      fs.copyFileSync(sidecarPath, `${backupBasePath}${suffix}`);
+    }
+  }
+
+  return backupBasePath;
+}
 
 function countRows(table: string): number {
   const row = db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as {
@@ -37,6 +66,7 @@ function removeReceiptPdfs(): number {
 }
 
 const before = Object.fromEntries(tables.map((table) => [table, countRows(table)]));
+const backupPath = createDatabaseBackup();
 
 db.transaction(() => {
   for (const table of tables) {
@@ -52,4 +82,5 @@ const after = Object.fromEntries(tables.map((table) => [table, countRows(table)]
 
 console.log("Reset counts before:", before);
 console.log("Reset counts after:", after);
+console.log("Database backup:", backupPath ?? "no database file found");
 console.log("Removed receipt PDFs:", removeReceiptPdfs());

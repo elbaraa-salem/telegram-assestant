@@ -91,6 +91,9 @@
         </td>
         <td class="actions">
           <a class="button button-secondary" href="/students/<%= student.id %>/edit">Edit</a>
+          <form method="post" action="/students/<%= student.id %>/sync-calendar">
+            <button class="button" type="submit">Sync calendar</button>
+          </form>
         </td>
       </tr>
     <% }) %>

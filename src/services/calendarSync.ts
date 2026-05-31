@@ -10,8 +10,13 @@ const credentialsPath = path.join(
   "config",
   "google-credentials.json"
 );
-
 const tokenPath = path.join(process.cwd(), "config", "google-token.json");
+const serviceAccountDefaultPath = path.join(
+  process.cwd(),
+  "config",
+  "google-service-account.json"
+);
+const calendarReadonlyScopes = ["https://www.googleapis.com/auth/calendar.readonly"];
 
 const protectedLessonStatuses = new Set([
   "completed",
@@ -81,7 +86,26 @@ type SyncWindow = {
   maxResults: number;
 };
 
-function isInvalidGrantError(error: unknown): boolean {
+export type CalendarAuthMode = "oauth" | "service_account";
+
+export type CalendarRuntimeStatus = {
+  authMode: CalendarAuthMode;
+  calendarId: string;
+  connected: boolean;
+  lastSyncTime: string | null;
+  lastSyncStatus: string | null;
+  lastSyncError: string | null;
+  lastInsertedLessons: number;
+  lastUpdatedLessons: number;
+  lastSkippedProtectedLessons: number;
+};
+
+export type SyncCalendarOptions = {
+  studentId?: number;
+  events?: calendar_v3.Schema$Event[];
+};
+
+export function isInvalidGrantError(error: unknown): boolean {
   if (!error || typeof error !== "object") {
     return String(error).includes("invalid_grant");
   }
@@ -118,18 +142,20 @@ function getNonNegativeIntegerEnv(name: string, fallback: number): number {
 }
 
 function createSyncWindow(now = new Date()): SyncWindow {
-  const includePastHours = getNonNegativeIntegerEnv(
-    "CALENDAR_SYNC_INCLUDE_PAST_HOURS",
-    0
+  const lookbackDays = getNonNegativeIntegerEnv(
+    "CALENDAR_SYNC_LOOKBACK_DAYS",
+    getNonNegativeIntegerEnv("CALENDAR_SYNC_INCLUDE_PAST_HOURS", 0) / 24
   );
-  const futureDays = getPositiveIntegerEnv("CALENDAR_SYNC_DAYS_AHEAD", 3);
+  const futureDays = getPositiveIntegerEnv(
+    "CALENDAR_SYNC_LOOKAHEAD_DAYS",
+    getPositiveIntegerEnv("CALENDAR_SYNC_DAYS_AHEAD", 30)
+  );
   const maxResults = getPositiveIntegerEnv("CALENDAR_SYNC_MAX_RESULTS", 250);
-  const millisecondsPerHour = 60 * 60 * 1000;
-  const millisecondsPerDay = 24 * millisecondsPerHour;
+  const millisecondsPerDay = 24 * 60 * 60 * 1000;
 
   return {
     timeMin: new Date(
-      now.getTime() - includePastHours * millisecondsPerHour
+      now.getTime() - lookbackDays * millisecondsPerDay
     ).toISOString(),
     timeMax: new Date(
       now.getTime() + futureDays * millisecondsPerDay
@@ -138,10 +164,43 @@ function createSyncWindow(now = new Date()): SyncWindow {
   };
 }
 
+export function getCalendarAuthMode(): CalendarAuthMode {
+  const authMode = process.env.GOOGLE_AUTH_MODE?.trim() || "oauth";
+
+  return authMode === "service_account" ? "service_account" : "oauth";
+}
+
+export function getCalendarId(): string {
+  return process.env.GOOGLE_CALENDAR_ID?.trim() || "primary";
+}
+
 function createCalendarClient(): calendar_v3.Calendar {
+  const authMode = getCalendarAuthMode();
+
+  console.log("calendar auth mode", { authMode });
+
+  if (authMode === "service_account") {
+    const keyFile =
+      process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE?.trim() ||
+      serviceAccountDefaultPath;
+    const auth = new google.auth.GoogleAuth({
+      keyFile,
+      scopes: calendarReadonlyScopes,
+    });
+
+    return google.calendar({
+      version: "v3",
+      auth,
+    });
+  }
+
   const credentials = JSON.parse(fs.readFileSync(credentialsPath, "utf8"));
   const tokens = JSON.parse(fs.readFileSync(tokenPath, "utf8"));
-  const clientInfo = credentials.installed;
+  const clientInfo = credentials.installed ?? credentials.web;
+
+  if (!clientInfo) {
+    throw new Error("Missing installed or web OAuth client in Google credentials");
+  }
 
   const oauth2Client = new google.auth.OAuth2(
     clientInfo.client_id,
@@ -221,10 +280,11 @@ async function listUpcomingEvents(
 ): Promise<calendar_v3.Schema$Event[]> {
   const events: calendar_v3.Schema$Event[] = [];
   let pageToken: string | undefined;
+  const calendarId = getCalendarId();
 
   do {
     const response = await calendar.events.list({
-      calendarId: "primary",
+      calendarId,
       singleEvents: true,
       showDeleted: true,
       orderBy: "startTime",
@@ -241,8 +301,85 @@ async function listUpcomingEvents(
   return events;
 }
 
-export async function syncCalendarLessons(): Promise<SyncResult> {
+function getSetting(key: string): string | null {
+  const row = db
+    .prepare("SELECT value FROM app_settings WHERE key = ?")
+    .get(key) as { value: string } | undefined;
+
+  return row?.value ?? null;
+}
+
+function setSetting(key: string, value: string): void {
+  db.prepare(
+    `
+      INSERT INTO app_settings (key, value)
+      VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `
+  ).run(key, value);
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function saveCalendarSyncStatus(
+  status: "success" | "failed",
+  result: SyncResult | null,
+  error: unknown = null
+): void {
+  setSetting("calendar.last_sync_time", new Date().toISOString());
+  setSetting("calendar.last_sync_status", status);
+  setSetting("calendar.last_sync_error", error ? getErrorMessage(error) : "");
+  setSetting(
+    "calendar.last_inserted_lessons",
+    String(result?.insertedLessons ?? 0)
+  );
+  setSetting("calendar.last_updated_lessons", String(result?.updatedLessons ?? 0));
+  setSetting(
+    "calendar.last_skipped_protected_lessons",
+    String(result?.skippedProtectedLessons ?? 0)
+  );
+}
+
+export function getCalendarRuntimeStatus(): CalendarRuntimeStatus {
+  return {
+    authMode: getCalendarAuthMode(),
+    calendarId: getCalendarId(),
+    connected: getSetting("calendar.last_sync_status") === "success",
+    lastSyncTime: getSetting("calendar.last_sync_time"),
+    lastSyncStatus: getSetting("calendar.last_sync_status"),
+    lastSyncError: getSetting("calendar.last_sync_error"),
+    lastInsertedLessons: Number(getSetting("calendar.last_inserted_lessons") ?? 0),
+    lastUpdatedLessons: Number(getSetting("calendar.last_updated_lessons") ?? 0),
+    lastSkippedProtectedLessons: Number(
+      getSetting("calendar.last_skipped_protected_lessons") ?? 0
+    ),
+  };
+}
+
+export async function testCalendarConnection(): Promise<boolean> {
   const calendar = createCalendarClient();
+  await calendar.events.list({
+    calendarId: getCalendarId(),
+    maxResults: 1,
+    singleEvents: true,
+  });
+
+  return true;
+}
+
+export async function syncCalendarLessons(
+  options: SyncCalendarOptions = {}
+): Promise<SyncResult> {
+  console.log("calendar sync started", {
+    authMode: getCalendarAuthMode(),
+    calendarId: getCalendarId(),
+    studentId: options.studentId ?? null,
+  });
+
+  try {
+  const calendar = options.events ? null : createCalendarClient();
   const syncWindow = createSyncWindow();
   const lessonMarkers = getLessonMarkers();
   const dryRun = process.env.CALENDAR_SYNC_DRY_RUN === "true";
@@ -253,10 +390,11 @@ export async function syncCalendarLessons(): Promise<SyncResult> {
         FROM students
         WHERE is_active = 1
           AND calendar_keyword != ''
+          AND (? IS NULL OR id = ?)
         ORDER BY length(calendar_keyword) DESC
       `
     )
-    .all() as Student[];
+    .all(options.studentId ?? null, options.studentId ?? null) as Student[];
 
   const existingLessonByGoogleId = db.prepare(
     `
@@ -312,7 +450,7 @@ export async function syncCalendarLessons(): Promise<SyncResult> {
     matchedEventDetails: [],
   };
 
-  const events = await listUpcomingEvents(calendar, syncWindow);
+  const events = options.events ?? (await listUpcomingEvents(calendar!, syncWindow));
   result.scannedEvents = events.length;
 
   const maxLessonsPerStudent = getPositiveIntegerEnv(
@@ -477,7 +615,23 @@ export async function syncCalendarLessons(): Promise<SyncResult> {
     syncEvents(events);
   }
 
+  saveCalendarSyncStatus("success", result);
+  console.log("calendar sync finished", {
+    scannedEvents: result.scannedEvents,
+    matchedEvents: result.matchedEvents,
+    insertedLessons: result.insertedLessons,
+    updatedLessons: result.updatedLessons,
+    skippedProtectedLessons: result.skippedProtectedLessons,
+  });
+
   return result;
+  } catch (error) {
+    saveCalendarSyncStatus("failed", null, error);
+    console.error("calendar sync failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
 }
 
 async function main() {

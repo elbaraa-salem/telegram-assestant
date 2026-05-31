@@ -1,0 +1,40 @@
+<section class="page-header">
+  <h1>Calendar</h1>
+</section>
+
+<section class="card form">
+  <h2>Status</h2>
+
+  <dl class="details-list">
+    <dt>Auth mode</dt>
+    <dd><%= calendar.authMode %></dd>
+
+    <dt>Calendar ID</dt>
+    <dd><%= calendar.calendarId %></dd>
+
+    <dt>Connected</dt>
+    <dd><%= calendar.connected ? "yes" : "no" %></dd>
+
+    <dt>Last sync time</dt>
+    <dd><%= calendar.lastSyncTime || "" %></dd>
+
+    <dt>Last sync status</dt>
+    <dd><%= calendar.lastSyncStatus || "" %></dd>
+
+    <dt>Last sync error</dt>
+    <dd><%= calendar.lastSyncError || calendar.connectionError || "" %></dd>
+
+    <dt>Created lessons</dt>
+    <dd><%= calendar.lastInsertedLessons %></dd>
+
+    <dt>Updated lessons</dt>
+    <dd><%= calendar.lastUpdatedLessons %></dd>
+
+    <dt>Skipped protected</dt>
+    <dd><%= calendar.lastSkippedProtectedLessons %></dd>
+  </dl>
+
+  <form method="post" action="/calendar/sync">
+    <button class="button" type="submit">Sync calendar now</button>
+  </form>
+</section>
