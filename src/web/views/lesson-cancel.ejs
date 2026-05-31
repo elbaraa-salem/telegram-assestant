@@ -1,0 +1,73 @@
+<section class="page-header">
+  <h1>Cancel lesson</h1>
+</section>
+
+<section class="card form cancel-lesson">
+  <h2>Lesson details</h2>
+
+  <dl class="details-list">
+    <dt>Student</dt>
+    <dd><%= lesson.name_ru || "Unknown student" %></dd>
+
+    <dt>Date</dt>
+    <dd><%= lesson.formattedStartTime.date %></dd>
+
+    <dt>Time</dt>
+    <dd><%= lesson.formattedStartTime.time %></dd>
+
+    <dt>Status</dt>
+    <dd><%= lesson.status %></dd>
+
+    <dt>Student response</dt>
+    <dd><%= lesson.student_response || "" %></dd>
+  </dl>
+
+  <% if (lesson.hasCancellationRequest) { %>
+    <div class="notice notice-warning">
+      <strong>Student requested cancellation</strong>
+      <% if (lesson.cancellation_reason) { %>
+        <br>Reason: <%= lesson.cancellation_reason %>
+      <% } %>
+      <% if (lesson.cancellation_requested_at) { %>
+        <br>Requested at: <%= lesson.cancellation_requested_at %>
+      <% } %>
+    </div>
+  <% } %>
+
+  <form method="post" action="/lessons/<%= lesson.id %>/cancel">
+    <fieldset>
+      <legend>Who cancelled?</legend>
+
+      <label class="radio-row">
+        <input
+          type="radio"
+          name="cancellation_source"
+          value="student"
+          required
+          <%= lesson.defaultCancellationSource === "student" ? "checked" : "" %>
+        >
+        Student cancelled
+      </label>
+
+      <label class="radio-row">
+        <input
+          type="radio"
+          name="cancellation_source"
+          value="teacher"
+          <%= lesson.defaultCancellationSource === "teacher" ? "checked" : "" %>
+        >
+        Teacher cancelled
+      </label>
+    </fieldset>
+
+    <label>
+      Cancellation reason
+      <textarea name="cancellation_reason" rows="5"><%= lesson.cancellation_reason || "" %></textarea>
+    </label>
+
+    <div class="form-actions">
+      <button class="button button-danger" type="submit">Confirm cancellation</button>
+      <a class="button button-secondary" href="/lessons">Back</a>
+    </div>
+  </form>
+</section>

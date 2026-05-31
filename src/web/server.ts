@@ -3,9 +3,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { db } from "../database/db";
 import {
+  addManualStudentPayment,
   completeLesson,
   confirmLessonPayment,
 } from "../services/lessonCompletionService";
+import {
+  createManualCharge,
+  getStudentBalanceSummary,
+} from "../services/paymentBalanceService";
 
 const app = express();
 const port = Number(process.env.ADMIN_PORT ?? 3000);
@@ -20,9 +25,8 @@ type Student = {
   calendar_keyword: string;
   is_active: number;
   created_at: string;
-  package_id: number | null;
-  package_used_lessons: number | null;
-  package_total_lessons: number | null;
+  lesson_price_amount: number;
+  lesson_price_currency: string;
 };
 
 type LessonRow = {
@@ -32,10 +36,15 @@ type LessonRow = {
   start_time: string;
   status: string;
   student_response: string | null;
+  cancellation_source: string | null;
+  awaiting_cancellation_reason: number;
   cancellation_reason: string | null;
   cancellation_requested_at: string | null;
   payment_status: string | null;
   payment_method: string | null;
+  charge_amount: number | null;
+  charge_paid_amount: number | null;
+  charge_status: string | null;
   package_used_lessons: number | null;
   package_total_lessons: number | null;
   receipt_file_path: string | null;
@@ -52,6 +61,114 @@ type StoredReceiptAiResult = {
   reason?: string;
 };
 
+type LessonCancelRow = {
+  id: number;
+  title: string;
+  name_ru: string | null;
+  start_time: string;
+  status: string;
+  student_response: string | null;
+  cancellation_source: string | null;
+  awaiting_cancellation_reason: number;
+  cancellation_reason: string | null;
+  cancellation_requested_at: string | null;
+};
+
+const cancellableLessonStatuses = new Set([
+  "scheduled",
+  "confirmed",
+  "ready",
+  "cancellation_requested",
+]);
+
+const completedLessonStatuses = new Set(["completed"]);
+
+function isCancellableLessonStatus(status: string): boolean {
+  return cancellableLessonStatuses.has(status);
+}
+
+function isCancelledLessonStatus(status: string): boolean {
+  return (
+    status === "cancelled" ||
+    status === "cancelled_by_student" ||
+    status === "cancelled_by_teacher"
+  );
+}
+
+function buildCancellationRequested(lesson: {
+  awaiting_cancellation_reason: number;
+  cancellation_reason: string | null;
+  cancellation_requested_at: string | null;
+}): boolean {
+  return Boolean(
+    lesson.awaiting_cancellation_reason ||
+      lesson.cancellation_reason ||
+      lesson.cancellation_requested_at
+  );
+}
+
+function renderInvalidLesson(response: express.Response): void {
+  response.status(400).render("layout", {
+    title: "Invalid lesson",
+    page: "error",
+    message: "Invalid lesson ID.",
+  });
+}
+
+function getCancelLesson(lessonId: number): LessonCancelRow | undefined {
+  return db
+    .prepare(
+      `
+        SELECT
+          lessons.id,
+          lessons.title,
+          students.name_ru,
+          lessons.start_time,
+          lessons.status,
+          lessons.student_response,
+          lessons.cancellation_source,
+          lessons.awaiting_cancellation_reason,
+          lessons.cancellation_reason,
+          lessons.cancellation_requested_at
+        FROM lessons
+        LEFT JOIN students ON students.id = lessons.student_id
+        WHERE lessons.id = ?
+      `
+    )
+    .get(lessonId) as LessonCancelRow | undefined;
+}
+
+function formatLessonStartTime(startTime: string): {
+  date: string;
+  time: string;
+} {
+  const lessonDate = new Date(startTime);
+
+  if (Number.isNaN(lessonDate.getTime())) {
+    return {
+      date: startTime,
+      time: "",
+    };
+  }
+
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Tomsk",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(lessonDate);
+
+  const partMap = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+
+  return {
+    date: `${partMap.day}.${partMap.month}.${partMap.year}`,
+    time: `${partMap.hour}:${partMap.minute}`,
+  };
+}
+
 function normalizeTelegramUsername(value: string): string {
   const trimmed = value.trim();
 
@@ -60,6 +177,63 @@ function normalizeTelegramUsername(value: string): string {
   }
 
   return trimmed.startsWith("@") ? trimmed : `@${trimmed}`;
+}
+
+function getStudentById(studentId: number): Student | undefined {
+  return db
+    .prepare(
+      `
+        SELECT
+          students.id,
+          students.name_ru,
+          students.name_ar,
+          students.telegram_username,
+          students.telegram_id,
+          students.calendar_keyword,
+          students.is_active,
+          students.created_at,
+          students.lesson_price_amount,
+          students.lesson_price_currency
+        FROM students
+        WHERE students.id = ?
+      `
+    )
+    .get(studentId) as Student | undefined;
+}
+
+function renderStudentNotFound(response: express.Response): void {
+  response.status(404).render("layout", {
+    title: "Student not found",
+    page: "error",
+    message: "Student not found.",
+  });
+}
+
+function getStudentFormInput(body: Record<string, unknown>) {
+  const lessonPriceAmount = Number(body.lesson_price_amount ?? 0);
+
+  return {
+    nameRu: String(body.name_ru ?? "").trim(),
+    nameAr: String(body.name_ar ?? "").trim(),
+    telegramUsername: normalizeTelegramUsername(
+      String(body.telegram_username ?? "")
+    ),
+    telegramId: String(body.telegram_id ?? "").trim() || null,
+    calendarKeyword: String(body.calendar_keyword ?? "").trim(),
+    isActive: body.is_active === "1" || body.is_active === "on" ? 1 : 0,
+    lessonPriceAmount,
+    lessonPriceCurrency:
+      String(body.lesson_price_currency ?? "RUB").trim() || "RUB",
+  };
+}
+
+function isValidStudentInput(input: ReturnType<typeof getStudentFormInput>): boolean {
+  return (
+    Boolean(input.nameRu || input.nameAr) &&
+    Boolean(input.calendarKeyword) &&
+    Number.isFinite(input.lessonPriceAmount) &&
+    input.lessonPriceAmount >= 0
+  );
 }
 
 function buildAiReceipt(lesson: LessonRow) {
@@ -113,42 +287,29 @@ app.get("/students", (_request, response) => {
           students.calendar_keyword,
           students.is_active,
           students.created_at,
-          lesson_packages.id AS package_id,
-          lesson_packages.used_lessons AS package_used_lessons,
-          lesson_packages.total_lessons AS package_total_lessons
+          students.lesson_price_amount,
+          students.lesson_price_currency
         FROM students
-        LEFT JOIN lesson_packages
-          ON lesson_packages.id = (
-            SELECT id
-            FROM lesson_packages
-            WHERE student_id = students.id
-              AND status = 'active'
-              AND used_lessons < total_lessons
-            ORDER BY created_at ASC, id ASC
-            LIMIT 1
-          )
         ORDER BY students.id
       `
     )
     .all() as Student[];
+  const viewStudents = students.map((student) => ({
+    ...student,
+    balance: getStudentBalanceSummary(student.id),
+  }));
 
   response.render("layout", {
     title: "Students",
     page: "students",
-    students,
+    students: viewStudents,
   });
 });
 
 app.post("/students", (request, response) => {
-  const nameRu = String(request.body.name_ru ?? "").trim();
-  const nameAr = String(request.body.name_ar ?? "").trim();
-  const calendarKeyword = String(request.body.calendar_keyword ?? "").trim();
-  const telegramUsername = normalizeTelegramUsername(
-    String(request.body.telegram_username ?? "")
-  );
-  const telegramId = String(request.body.telegram_id ?? "").trim() || null;
+  const input = getStudentFormInput(request.body);
 
-  if ((!nameRu && !nameAr) || !calendarKeyword) {
+  if (!isValidStudentInput(input)) {
     response.status(400).render("layout", {
       title: "Invalid student",
       page: "error",
@@ -165,12 +326,147 @@ app.post("/students", (request, response) => {
         telegram_username,
         telegram_id,
         calendar_keyword,
+        lesson_price_amount,
+        lesson_price_currency,
         is_active,
         created_at
       )
-      VALUES (?, ?, ?, ?, ?, 1, datetime('now'))
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1, datetime('now'))
     `
-  ).run(nameRu, nameAr, telegramUsername, telegramId, calendarKeyword);
+  ).run(
+    input.nameRu,
+    input.nameAr,
+    input.telegramUsername,
+    input.telegramId,
+    input.calendarKeyword,
+    Math.round(input.lessonPriceAmount),
+    input.lessonPriceCurrency
+  );
+
+  response.redirect("/students");
+});
+
+app.get("/students/:id/edit", (request, response) => {
+  const studentId = Number(request.params.id);
+
+  if (!Number.isInteger(studentId) || studentId <= 0) {
+    response.status(400).render("layout", {
+      title: "Invalid student",
+      page: "error",
+      message: "Invalid student ID.",
+    });
+    return;
+  }
+
+  const student = getStudentById(studentId);
+
+  if (!student) {
+    renderStudentNotFound(response);
+    return;
+  }
+
+  response.render("layout", {
+    title: "Edit student",
+    page: "student-edit",
+    student,
+  });
+});
+
+app.post("/students/:id/edit", (request, response) => {
+  const studentId = Number(request.params.id);
+
+  if (!Number.isInteger(studentId) || studentId <= 0) {
+    response.status(400).render("layout", {
+      title: "Invalid student",
+      page: "error",
+      message: "Invalid student ID.",
+    });
+    return;
+  }
+
+  const student = getStudentById(studentId);
+
+  if (!student) {
+    renderStudentNotFound(response);
+    return;
+  }
+
+  const input = getStudentFormInput(request.body);
+
+  if (!isValidStudentInput(input)) {
+    response.status(400).render("layout", {
+      title: "Invalid student",
+      page: "error",
+      message: "Provide at least one name, a calendar keyword, and a valid price.",
+    });
+    return;
+  }
+
+  const updatedPriceAmount = Math.round(input.lessonPriceAmount);
+
+  try {
+    db.prepare(
+      `
+        UPDATE students
+        SET name_ru = ?,
+            name_ar = ?,
+            telegram_username = ?,
+            telegram_id = ?,
+            calendar_keyword = ?,
+            is_active = ?,
+            lesson_price_amount = ?,
+            lesson_price_currency = ?
+        WHERE id = ?
+      `
+    ).run(
+      input.nameRu,
+      input.nameAr,
+      input.telegramUsername,
+      input.telegramId,
+      input.calendarKeyword,
+      input.isActive,
+      updatedPriceAmount,
+      input.lessonPriceCurrency,
+      studentId
+    );
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.includes("UNIQUE constraint failed")
+    ) {
+      response.status(400).render("layout", {
+        title: "Duplicate calendar keyword",
+        page: "error",
+        message: "Calendar keyword is already used by another student.",
+      });
+      return;
+    }
+
+    throw error;
+  }
+
+  console.log("student updated", {
+    studentId,
+    nameRu: input.nameRu,
+    nameAr: input.nameAr,
+    telegramUsername: input.telegramUsername || null,
+    telegramId: input.telegramId,
+    calendarKeyword: input.calendarKeyword,
+    isActive: input.isActive,
+  });
+
+  if (
+    student.lesson_price_amount !== updatedPriceAmount ||
+    student.lesson_price_currency !== input.lessonPriceCurrency
+  ) {
+    console.log("lesson price changed", {
+      studentId,
+      oldAmount: student.lesson_price_amount,
+      oldCurrency: student.lesson_price_currency,
+      newAmount: updatedPriceAmount,
+      newCurrency: input.lessonPriceCurrency,
+    });
+  }
 
   response.redirect("/students");
 });
@@ -315,23 +611,38 @@ app.get("/lessons", (_request, response) => {
           lessons.start_time,
           lessons.status,
           lessons.student_response,
+          lessons.cancellation_source,
+          lessons.awaiting_cancellation_reason,
           lessons.cancellation_reason,
           lessons.cancellation_requested_at,
-          payments.status AS payment_status,
-          payments.payment_method,
-          lesson_packages.used_lessons AS package_used_lessons,
-          lesson_packages.total_lessons AS package_total_lessons,
-          payments.receipt_file_path AS receipt_file_path,
-          payments.receipt_text AS receipt_text,
-          payments.ai_amount AS ai_amount,
-          payments.ai_currency AS ai_currency,
-          payments.ai_payment_date AS ai_payment_date,
-          payments.ai_confidence AS ai_confidence,
-          payments.ai_raw_result AS ai_raw_result
+          lesson_charges.status AS payment_status,
+          NULL AS payment_method,
+          NULL AS package_used_lessons,
+          NULL AS package_total_lessons,
+          lesson_charges.amount AS charge_amount,
+          lesson_charges.paid_amount AS charge_paid_amount,
+          lesson_charges.status AS charge_status,
+          latest_payment.receipt_file_path AS receipt_file_path,
+          latest_payment.receipt_text AS receipt_text,
+          latest_payment.ai_amount AS ai_amount,
+          latest_payment.ai_currency AS ai_currency,
+          latest_payment.ai_payment_date AS ai_payment_date,
+          latest_payment.ai_confidence AS ai_confidence,
+          latest_payment.ai_raw_result AS ai_raw_result
         FROM lessons
         LEFT JOIN students ON students.id = lessons.student_id
-        LEFT JOIN payments ON payments.lesson_id = lessons.id
-        LEFT JOIN lesson_packages ON lesson_packages.id = payments.prepaid_package_id
+        LEFT JOIN lesson_charges ON lesson_charges.lesson_id = lessons.id
+        LEFT JOIN payment_allocations ON payment_allocations.lesson_charge_id = lesson_charges.id
+        LEFT JOIN payments AS latest_payment
+          ON latest_payment.id = (
+            SELECT payments.id
+            FROM payments
+            JOIN payment_allocations AS pa ON pa.payment_id = payments.id
+            WHERE pa.lesson_charge_id = lesson_charges.id
+            ORDER BY payments.paid_at DESC, payments.id DESC
+            LIMIT 1
+          )
+        GROUP BY lessons.id
         ORDER BY lessons.start_time DESC
       `
     )
@@ -339,16 +650,19 @@ app.get("/lessons", (_request, response) => {
 
   const viewLessons = lessons.map((lesson) => ({
     ...lesson,
+    formattedStartTime: formatLessonStartTime(lesson.start_time),
     packageProgress:
       lesson.payment_method === "package" &&
       lesson.package_used_lessons !== null &&
       lesson.package_total_lessons !== null
         ? `${lesson.package_used_lessons} / ${lesson.package_total_lessons}`
         : "",
-    canComplete: lesson.status === "scheduled" || lesson.status === "confirmed",
-    canConfirmPayment: ["unpaid", "requested", "receipt_received", "rejected"].includes(
-      lesson.payment_status ?? ""
-    ),
+    hasCancellationRequest: buildCancellationRequested(lesson),
+    canCancel: isCancellableLessonStatus(lesson.status),
+    canComplete: isCancellableLessonStatus(lesson.status),
+    canConfirmPayment:
+      !isCancelledLessonStatus(lesson.status) &&
+      ["unpaid", "partial"].includes(lesson.payment_status ?? ""),
     aiReceipt: buildAiReceipt(lesson),
   }));
 
@@ -359,15 +673,133 @@ app.get("/lessons", (_request, response) => {
   });
 });
 
+app.get("/lessons/:id/cancel", (request, response) => {
+  const lessonId = Number(request.params.id);
+
+  if (!Number.isInteger(lessonId) || lessonId <= 0) {
+    renderInvalidLesson(response);
+    return;
+  }
+
+  const lesson = getCancelLesson(lessonId);
+
+  if (!lesson) {
+    response.status(404).render("layout", {
+      title: "Lesson not found",
+      page: "error",
+      message: "Lesson not found.",
+    });
+    return;
+  }
+
+  if (completedLessonStatuses.has(lesson.status)) {
+    response.status(400).render("layout", {
+      title: "Lesson already completed",
+      page: "error",
+      message: "Completed lessons cannot be cancelled.",
+    });
+    return;
+  }
+
+  if (isCancelledLessonStatus(lesson.status)) {
+    response.status(400).render("layout", {
+      title: "Lesson already cancelled",
+      page: "error",
+      message: "This lesson is already cancelled.",
+    });
+    return;
+  }
+
+  response.render("layout", {
+    title: "Cancel lesson",
+    page: "lesson-cancel",
+    lesson: {
+      ...lesson,
+      formattedStartTime: formatLessonStartTime(lesson.start_time),
+      hasCancellationRequest: buildCancellationRequested(lesson),
+      defaultCancellationSource:
+        lesson.cancellation_source === "teacher"
+          ? "teacher"
+          : lesson.cancellation_source === "student" ||
+              buildCancellationRequested(lesson)
+            ? "student"
+            : "",
+    },
+  });
+});
+
+app.post("/lessons/:id/cancel", (request, response) => {
+  const lessonId = Number(request.params.id);
+
+  if (!Number.isInteger(lessonId) || lessonId <= 0) {
+    renderInvalidLesson(response);
+    return;
+  }
+
+  const lesson = getCancelLesson(lessonId);
+
+  if (!lesson) {
+    response.status(404).render("layout", {
+      title: "Lesson not found",
+      page: "error",
+      message: "Lesson not found.",
+    });
+    return;
+  }
+
+  if (completedLessonStatuses.has(lesson.status)) {
+    response.status(400).render("layout", {
+      title: "Lesson already completed",
+      page: "error",
+      message: "Completed lessons cannot be cancelled.",
+    });
+    return;
+  }
+
+  if (isCancelledLessonStatus(lesson.status)) {
+    response.redirect("/lessons");
+    return;
+  }
+
+  const cancellationSource = String(request.body.cancellation_source ?? "").trim();
+  const submittedReason = String(request.body.cancellation_reason ?? "").trim();
+
+  if (!["student", "teacher"].includes(cancellationSource)) {
+    response.status(400).render("layout", {
+      title: "Invalid cancellation source",
+      page: "error",
+      message: "Choose who cancelled the lesson.",
+    });
+    return;
+  }
+
+  const cancellationReason = submittedReason || lesson.cancellation_reason || null;
+
+  db.prepare(
+    `
+      UPDATE lessons
+      SET status = 'cancelled',
+          cancellation_source = ?,
+          cancellation_reason = ?,
+          awaiting_cancellation_reason = 0,
+          cancellation_requested_at = COALESCE(cancellation_requested_at, datetime('now')),
+          cancellation_confirmed_at = datetime('now'),
+          cancellation_confirmed_by = 'admin',
+          updated_at = datetime('now')
+      WHERE id = ?
+        AND status != 'completed'
+        AND status NOT IN ('cancelled', 'cancelled_by_student', 'cancelled_by_teacher')
+    `
+  ).run(cancellationSource, cancellationReason, lessonId);
+
+  response.redirect("/lessons");
+});
+
 app.post("/lessons/:id/complete", async (request, response) => {
   const lessonId = Number(request.params.id);
 
   if (!Number.isInteger(lessonId) || lessonId <= 0) {
-    response.status(400).render("layout", {
-      title: "Invalid lesson",
-      page: "error",
-      message: "Invalid lesson ID.",
-    });
+    renderInvalidLesson(response);
     return;
   }
 
@@ -389,6 +821,103 @@ app.post("/lessons/:id/confirm-payment", async (request, response) => {
 
   await confirmLessonPayment(lessonId);
   response.redirect("/lessons");
+});
+
+app.post("/manual-payments", (request, response) => {
+  const studentId = Number(request.body.student_id);
+  const amount = Number(request.body.amount);
+  const currency = String(request.body.currency ?? "RUB").trim() || "RUB";
+  const student = Number.isInteger(studentId)
+    ? (db
+        .prepare(
+          `
+            SELECT id
+            FROM students
+            WHERE id = ?
+          `
+        )
+        .get(studentId) as { id: number } | undefined)
+    : undefined;
+
+  if (
+    !Number.isInteger(studentId) ||
+    studentId <= 0 ||
+    !student ||
+    !Number.isFinite(amount) ||
+    amount <= 0
+  ) {
+    console.log("manual payment validation failed with submitted body", {
+      body: request.body,
+    });
+    response.status(400).render("layout", {
+      title: "Invalid manual payment",
+      page: "error",
+      message: "Provide a student and a positive payment amount.",
+    });
+    return;
+  }
+
+  const result = addManualStudentPayment(studentId, amount, currency);
+  console.log("manual payment created", {
+    studentId,
+    paymentId: result.paymentId,
+    amount: result.amount,
+    currency: result.currency,
+  });
+  console.log("manual payment allocated", {
+    studentId,
+    paymentId: result.paymentId,
+    allocatedAmount: result.allocatedAmount,
+    paidLessonsCount: result.paidLessonsCount,
+    prepaidAmount: result.prepaidAmount,
+    remainingDebtAmount: result.remainingDebtAmount,
+  });
+  response.redirect("/students");
+});
+
+app.post("/manual-debts", (request, response) => {
+  const studentId = Number(request.body.student_id);
+  const amount = Number(request.body.amount);
+  const currency = String(request.body.currency ?? "RUB").trim() || "RUB";
+  const note = String(request.body.note ?? "").trim() || null;
+  const student = Number.isInteger(studentId) ? getStudentById(studentId) : undefined;
+
+  if (
+    !Number.isInteger(studentId) ||
+    studentId <= 0 ||
+    !student ||
+    !Number.isFinite(amount) ||
+    amount <= 0
+  ) {
+    console.log("manual debt validation failed with submitted body", {
+      body: request.body,
+    });
+    response.status(400).render("layout", {
+      title: "Invalid manual debt",
+      page: "error",
+      message: "Provide a student and a positive debt amount.",
+    });
+    return;
+  }
+
+  const charge = createManualCharge(studentId, amount, currency, note);
+  const summary = getStudentBalanceSummary(studentId);
+
+  console.log("manual debt created", {
+    studentId,
+    chargeId: charge.id,
+    amount: charge.amount,
+    currency: charge.currency,
+    note,
+  });
+  console.log("manual debt balance updated", {
+    studentId,
+    chargeId: charge.id,
+    remainingDebtAmount: summary.unpaid_amount,
+    prepaidAmount: summary.prepaid_amount,
+  });
+
+  response.redirect("/students");
 });
 
 app.listen(port, () => {

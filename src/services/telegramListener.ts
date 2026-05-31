@@ -1,11 +1,18 @@
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { NewMessage, NewMessageEvent } from "telegram/events";
 import { Api, TelegramClient } from "telegram";
 import { db } from "../database/db";
 import { getTelegramClient } from "./telegramClient";
-import { analyzeAndSavePaymentReceipt } from "./receiptAnalysisService";
+import {
+  analyzeReceiptText,
+  extractTextFromPdf,
+  ReceiptAiResult,
+} from "./receiptAnalysisService";
+import { analyzeStudentReplyIntent } from "./studentReplyAiService";
+import { createReceiptPaymentAndApply } from "./paymentBalanceService";
 
 const recentLessonWindowHours = 4;
 const cancellationDeadlineHours = Number(
@@ -17,21 +24,34 @@ const pollingIntervalMs = Number(
   process.env.TELEGRAM_LISTENER_POLL_INTERVAL_MS ?? 5_000
 );
 const pollingLimit = Number(process.env.TELEGRAM_LISTENER_POLL_LIMIT ?? 5);
+const minimumStudentReplyAiConfidence = 0.75;
+const staleProcessingMessageMs = 5 * 60 * 1000;
+const studentReplyClarificationMessage =
+  "Я не совсем понял ответ. Напиши, пожалуйста:\n1 — да, я готов\n2 — нет, нужно отменить";
+const activeTelegramMessageLocks = new Set<string>();
 
 type Student = {
   id: number;
   telegram_id: string;
   telegram_username?: string | null;
+  name_ru?: string | null;
+  name_ar?: string | null;
 };
 
-type PdfReceiptPaymentCandidate = {
+type ReceiptTargetPayment = {
   id: number;
   status: string;
   lesson_id: number;
-  lesson_status: string;
-  student_response: string | null;
+};
+
+type ReceiptTargetLesson = {
+  id: number;
   start_time: string;
-  receipt_file_path: string | null;
+};
+
+type ClassifiedPdfReceipt = {
+  extractedText: string;
+  aiResult: ReceiptAiResult;
 };
 
 type Lesson = {
@@ -40,6 +60,7 @@ type Lesson = {
   status: string;
   student_response: string | null;
   awaiting_cancellation_reason: number;
+  cancellation_reason: string | null;
 };
 
 function findNearestRemindedLesson(studentId: number): Lesson | null {
@@ -49,13 +70,22 @@ function findNearestRemindedLesson(studentId: number): Lesson | null {
   const lessons = db
     .prepare(
       `
-        SELECT id, start_time, status, student_response, awaiting_cancellation_reason
+        SELECT
+          id,
+          start_time,
+          status,
+          student_response,
+          awaiting_cancellation_reason,
+          cancellation_reason
         FROM lessons
         WHERE student_id = ?
           AND reminder_sent = 1
           AND status IN (
             'scheduled',
             'confirmed',
+            'ready',
+            'cancellation_requested',
+            'cancelled',
             'cancelled_by_student',
             'cancelled_by_teacher'
           )
@@ -84,7 +114,7 @@ function findStudentByTelegramId(telegramId: string): Student | undefined {
   return db
     .prepare(
       `
-        SELECT id, telegram_id
+        SELECT id, telegram_id, name_ru, name_ar
         FROM students
         WHERE telegram_id = ?
       `
@@ -101,7 +131,7 @@ function findStudentByTelegramUsername(username: string): Student | undefined {
   return db
     .prepare(
       `
-        SELECT id, telegram_id, telegram_username
+        SELECT id, telegram_id, telegram_username, name_ru, name_ar
         FROM students
         WHERE telegram_username = ?
       `
@@ -142,148 +172,467 @@ function isPdfDocument(document: Api.Document): boolean {
   );
 }
 
-function findPdfReceiptPayment(studentId: number): PdfReceiptPaymentCandidate | undefined {
-  const candidates = db
+const minimumReceiptConfidence = 0.8;
+
+function formatLessonCountRu(count: number): string {
+  const absoluteCount = Math.abs(count);
+  const lastTwoDigits = absoluteCount % 100;
+  const lastDigit = absoluteCount % 10;
+
+  if (lastTwoDigits >= 11 && lastTwoDigits <= 14) {
+    return `${count} уроков`;
+  }
+
+  if (lastDigit === 1) {
+    return `${count} урок`;
+  }
+
+  if (lastDigit >= 2 && lastDigit <= 4) {
+    return `${count} урока`;
+  }
+
+  return `${count} уроков`;
+}
+
+function findLatestLessonForReceipt(studentId: number): ReceiptTargetLesson | undefined {
+  const latestPastOrCurrent = db
     .prepare(
       `
-        SELECT
-          payments.id,
-          payments.status,
-          payments.lesson_id,
-          lessons.status AS lesson_status,
-          lessons.student_response,
-          lessons.start_time,
-          payments.receipt_file_path
-        FROM payments
-        INNER JOIN lessons ON lessons.id = payments.lesson_id
-        WHERE payments.student_id = ?
-        ORDER BY lessons.id DESC, payments.id DESC
+        SELECT id, start_time
+        FROM lessons
+        WHERE student_id = ?
+          AND datetime(start_time) <= datetime('now')
+        ORDER BY datetime(start_time) DESC, id DESC
+        LIMIT 1
       `
     )
-    .all(studentId) as PdfReceiptPaymentCandidate[];
+    .get(studentId) as ReceiptTargetLesson | undefined;
 
-  console.log(
-    "Candidate payments for PDF receipt",
-    candidates.map((candidate) => ({
-      payment_id: candidate.id,
-      payment_status: candidate.status,
-      lesson_id: candidate.lesson_id,
-      lesson_status: candidate.lesson_status,
-      student_response: candidate.student_response,
-      start_time: candidate.start_time,
-      receipt_file_path: candidate.receipt_file_path,
-    }))
-  );
+  if (latestPastOrCurrent) {
+    return latestPastOrCurrent;
+  }
 
-  const pendingReceiptStatuses = new Set(["requested", "receipt_received"]);
+  return db
+    .prepare(
+      `
+        SELECT id, start_time
+        FROM lessons
+        WHERE student_id = ?
+          AND datetime(start_time) > datetime('now')
+        ORDER BY datetime(start_time) ASC, id ASC
+        LIMIT 1
+      `
+    )
+    .get(studentId) as ReceiptTargetLesson | undefined;
+}
 
-  return candidates
-    .filter((candidate) => pendingReceiptStatuses.has(candidate.status))
-    .sort((left, right) => {
-      const leftCompleted = left.lesson_status === "completed" ? 1 : 0;
-      const rightCompleted = right.lesson_status === "completed" ? 1 : 0;
+function findNextUpcomingLesson(
+  studentId: number,
+  afterStartTime: string
+): ReceiptTargetLesson | undefined {
+  return db
+    .prepare(
+      `
+        SELECT id, start_time
+        FROM lessons
+        WHERE student_id = ?
+          AND datetime(start_time) > datetime(?)
+          AND datetime(start_time) > datetime('now')
+        ORDER BY datetime(start_time) ASC, id ASC
+        LIMIT 1
+      `
+    )
+    .get(studentId, afterStartTime) as ReceiptTargetLesson | undefined;
+}
 
-      if (leftCompleted !== rightCompleted) {
-        return rightCompleted - leftCompleted;
-      }
+function findReceiptTargetPaymentForStudent(
+  studentId: number
+): ReceiptTargetPayment | undefined {
+  const latestLesson = findLatestLessonForReceipt(studentId);
 
-      const leftStartTime = Date.parse(left.start_time);
-      const rightStartTime = Date.parse(right.start_time);
+  if (!latestLesson) {
+    return undefined;
+  }
 
-      if (!Number.isNaN(leftStartTime) && !Number.isNaN(rightStartTime)) {
-        if (leftStartTime !== rightStartTime) {
-          return rightStartTime - leftStartTime;
-        }
-      } else if (!Number.isNaN(leftStartTime)) {
-        return -1;
-      } else if (!Number.isNaN(rightStartTime)) {
-        return 1;
-      }
+  const nextLesson = findNextUpcomingLesson(studentId, latestLesson.start_time);
 
-      if (left.lesson_id !== right.lesson_id) {
-        return right.lesson_id - left.lesson_id;
-      }
+  if (!nextLesson) {
+    return undefined;
+  }
 
-      return right.id - left.id;
-    })[0];
+  return {
+    id: 0,
+    status: "unpaid",
+    lesson_id: nextLesson.id,
+  };
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "unknown error";
+}
+
+function getDownloadResultType(value: unknown): string {
+  if (Buffer.isBuffer(value)) {
+    return "Buffer";
+  }
+
+  if (value instanceof Uint8Array) {
+    return "Uint8Array";
+  }
+
+  if (value === undefined) {
+    return "undefined";
+  }
+
+  if (value === null) {
+    return "null";
+  }
+
+  return typeof value;
+}
+
+function isBinaryDownloadResult(value: unknown): value is Buffer | Uint8Array {
+  return Buffer.isBuffer(value) || value instanceof Uint8Array;
+}
+
+function getDownloadBufferLength(value: unknown): number | null {
+  if (isBinaryDownloadResult(value)) {
+    return value.length;
+  }
+
+  return null;
+}
+
+function getVerifiedFileSize(filePath: string): number | null {
+  if (!fsSync.existsSync(filePath)) {
+    return null;
+  }
+
+  return fsSync.statSync(filePath).size;
+}
+
+async function writeDownloadResultToTempFile(
+  downloadResult: unknown,
+  tempPath: string
+): Promise<void> {
+  if (Buffer.isBuffer(downloadResult)) {
+    await fs.writeFile(tempPath, downloadResult);
+    return;
+  }
+
+  if (downloadResult instanceof Uint8Array) {
+    await fs.writeFile(tempPath, Buffer.from(downloadResult));
+  }
 }
 
 async function handlePdfReceipt(
   message: NewMessageEvent["message"],
   student: Student,
-  chatId: string,
-  document: Api.Document
+  document: Api.Document,
+  telegramMessageRowId: number
 ): Promise<"saved_receipt" | "ignored"> {
   if (!isPdfDocument(document)) {
     console.log("Document received but not PDF");
     return "ignored";
   }
 
-  console.log("PDF receipt detected");
-
-  const payment = findPdfReceiptPayment(student.id);
-
-  if (!payment) {
-    console.log("PDF received but no pending payment found");
-    await message.respond({
-      message: "Сейчас я не ожидаю чек об оплате.",
-    });
-    return "ignored";
-  }
-
-  console.log(`Payment found for PDF receipt: ${payment.id}`);
-
   const receiptsDir = path.join(process.cwd(), "data", "receipts");
-  const receiptPath = path.join(receiptsDir, `payment-${payment.id}.pdf`);
-
-  await fs.mkdir(receiptsDir, { recursive: true });
-  await message.downloadMedia({ outputFile: receiptPath });
-  console.log(`Receipt saved: ${receiptPath}`);
-
-  db.prepare(
-    `
-      UPDATE payments
-      SET status = 'receipt_received',
-          receipt_received_at = datetime('now'),
-          telegram_message_id = ?,
-          telegram_file_id = ?,
-          receipt_file_path = ?,
-          updated_at = datetime('now')
-      WHERE id = ?
-    `
-  ).run(
-    message.id.toString(),
-    document.id.toString(),
-    receiptPath,
-    payment.id
+  const tempDir = path.join(receiptsDir, "tmp");
+  const tempPath = path.join(
+    tempDir,
+    `student-${student.id}-message-${message.id.toString()}.pdf`
   );
-  console.log("Payment status updated to receipt_received");
+  const receiptPath = path.join(
+    receiptsDir,
+    `student-${student.id}-message-${message.id.toString()}-receipt.pdf`
+  );
+  let receiptSaved = false;
+  const documentFilename = getDocumentFilename(document) ?? null;
 
-  try {
-    const analysis = await analyzeAndSavePaymentReceipt(payment.id);
-    const result = analysis.parsedAiResult;
-
-    console.log("AI receipt analysis completed", {
-      paymentId: payment.id,
-      amount: result.amount,
-      currency: result.currency,
-      payment_date: result.payment_date,
-      confidence: result.confidence,
-      payment_confirmed: result.payment_confirmed,
-    });
-  } catch (error) {
-    console.error(
-      "AI receipt analysis failed",
-      error instanceof Error ? error.message : "unknown error"
-    );
-  }
-
-  await message.respond({
-    message: "Чек получен ✅ Я проверю оплату.",
+  console.log("PDF receipt handler started", {
+    studentId: student.id,
+    senderId: student.telegram_id,
+    messageId: message.id.toString(),
   });
 
-  console.log(`PDF receipt saved for payment ${payment.id}`);
-  return "saved_receipt";
+  await fs.mkdir(receiptsDir, { recursive: true });
+  await fs.mkdir(tempDir, { recursive: true });
+
+  try {
+    console.log("pdf download started", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+      filename: documentFilename,
+      mimeType: document.mimeType,
+      tempPath,
+      finalPath: receiptPath,
+    });
+
+    const downloadResult: unknown = await message.downloadMedia();
+    const downloadResultType = getDownloadResultType(downloadResult);
+    const downloadBufferLength = getDownloadBufferLength(downloadResult);
+
+    console.log("download result type", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+      type: downloadResultType,
+    });
+    console.log("download buffer length", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+      bufferLength: downloadBufferLength,
+    });
+
+    if (downloadBufferLength === 0) {
+      throw new Error("Downloaded PDF buffer is empty");
+    }
+
+    if (isBinaryDownloadResult(downloadResult)) {
+      console.log("temp file write started", {
+        studentId: student.id,
+        messageId: message.id.toString(),
+        tempPath,
+      });
+      await writeDownloadResultToTempFile(downloadResult, tempPath);
+      console.log("temp file write completed", {
+        studentId: student.id,
+        messageId: message.id.toString(),
+        tempPath,
+      });
+    }
+
+    const tempFileSize = getVerifiedFileSize(tempPath);
+    console.log("temp file exists", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+      tempPath,
+      exists: tempFileSize !== null,
+    });
+
+    if (tempFileSize === null) {
+      console.error("PDF temp file was not created after download", {
+        messageId: message.id.toString(),
+        filename: documentFilename,
+        mimeType: document.mimeType,
+        tempPath,
+        finalPath: receiptPath,
+        downloadResultType,
+        downloadBufferLength,
+      });
+      throw new Error("PDF temp file was not created after download");
+    }
+
+    console.log("temp file size", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+      tempPath,
+      size: tempFileSize,
+    });
+
+    if (tempFileSize === 0) {
+      console.log("pdf ignored: downloaded file is empty", {
+        studentId: student.id,
+        messageId: message.id.toString(),
+        path: tempPath,
+      });
+      throw new Error("pdf ignored: downloaded file is empty");
+    }
+
+    console.log("PDF downloaded", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+      path: tempPath,
+      size: tempFileSize,
+    });
+
+    console.log("rename started", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+      tempPath,
+      finalPath: receiptPath,
+    });
+    await fs.rename(tempPath, receiptPath);
+    console.log("rename completed", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+      tempPath,
+      finalPath: receiptPath,
+    });
+
+    const finalFileSize = getVerifiedFileSize(receiptPath);
+    console.log("final file exists", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+      finalPath: receiptPath,
+      exists: finalFileSize !== null,
+    });
+
+    if (finalFileSize === null) {
+      throw new Error("PDF final file was not created after rename");
+    }
+
+    console.log("final file size", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+      finalPath: receiptPath,
+      size: finalFileSize,
+    });
+
+    if (finalFileSize === 0) {
+      throw new Error("PDF final file is empty after rename");
+    }
+
+    receiptSaved = true;
+
+    const extractedText = await extractTextFromPdf(receiptPath);
+    console.log("receipt text extracted", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+      textLength: extractedText.length,
+    });
+
+    console.log("AI receipt analysis started", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+    });
+    const analysis: ClassifiedPdfReceipt = {
+      extractedText,
+      aiResult: await analyzeReceiptText(extractedText),
+    };
+    const result = analysis.aiResult;
+    console.log("AI receipt analysis result", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+      isPaymentReceipt: result.is_payment_receipt,
+      paymentConfirmed: result.payment_confirmed,
+      amount: result.amount,
+      currency: result.currency,
+      confidence: result.confidence,
+      reason: result.reason,
+    });
+
+    const confidentReceipt =
+      result.is_payment_receipt === true &&
+      result.payment_confirmed === true &&
+      result.confidence !== null &&
+      result.confidence >= minimumReceiptConfidence;
+
+    if (!confidentReceipt) {
+      console.log("pdf ignored: not a receipt", {
+        studentId: student.id,
+        senderId: student.telegram_id,
+        messageId: message.id.toString(),
+        isPaymentReceipt: result.is_payment_receipt,
+        paymentConfirmed: result.payment_confirmed,
+        confidence: result.confidence,
+      });
+      return "ignored";
+    }
+
+    console.log("Payment receipt detected", {
+      studentId: student.id,
+      amount: result.amount,
+      currency: result.currency,
+      confidence: result.confidence,
+    });
+    console.log("receipt accepted without pending payment request", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+    });
+
+    const earlyPaymentTarget = findReceiptTargetPaymentForStudent(student.id);
+    if (earlyPaymentTarget) {
+      console.log("Target lesson selected for receipt", {
+        studentId: student.id,
+        lessonId: earlyPaymentTarget.lesson_id,
+      });
+    }
+
+    const application = createReceiptPaymentAndApply({
+      studentId: student.id,
+      telegramMessageRowId,
+      telegramMessageId: message.id.toString(),
+      telegramFileId: document.id.toString(),
+      receiptFilePath: receiptPath,
+      receiptText: analysis.extractedText,
+      aiResult: result,
+    });
+
+    if (application.conflict) {
+      throw new Error(
+        application.conflictMessage ??
+          `payment conflict for telegram_message_id ${message.id.toString()}`
+      );
+    }
+
+    if (application.duplicate) {
+      if (application.duplicateReason !== "telegram_message_id") {
+        await message.respond({
+          message: "Этот чек уже был учтён ранее ✅",
+        });
+      }
+      return "ignored";
+    }
+
+    console.log("payment saved", {
+      studentId: student.id,
+      paymentId: application.paymentId,
+      messageId: message.id.toString(),
+      amount: application.amount,
+      currency: application.currency,
+      allocatedAmount: application.allocatedAmount,
+      prepaidAmount: application.prepaidAmount,
+    });
+    if (application.allocatedAmount === 0) {
+      console.log("no debt found, adding full payment to prepaid balance", {
+        studentId: student.id,
+        paymentId: application.paymentId,
+        amount: application.amount,
+        currency: application.currency,
+        prepaidAmount: application.prepaidAmount,
+      });
+    }
+
+    const responseMessage =
+      application.remainingDebtAmount > 0
+        ? `Спасибо, оплата получена ✅
+
+Сумма: ${application.amount} ${application.currency}.
+Осталось к оплате: ${application.remainingDebtAmount} ${application.currency}.`
+        : application.paidLessonsCount > 0
+          ? `Спасибо, оплата получена ✅
+
+Сумма: ${application.amount} ${application.currency}.
+Погашено неоплаченных уроков: ${application.paidLessonsCount}.
+Осталось на балансе: ${formatLessonCountRu(application.prepaidLessonsCount)}.`
+          : `Спасибо, оплата получена ✅
+
+Сумма: ${application.amount} ${application.currency}.
+Стоимость одного урока: ${application.lessonPriceAmount} ${application.currency}.
+На балансе: ${formatLessonCountRu(application.prepaidLessonsCount)}.`;
+
+    await message.respond({
+      message: responseMessage,
+    });
+    console.log("confirmation message sent once", {
+      studentId: student.id,
+      paymentId: application.paymentId,
+      telegramMessageId: message.id.toString(),
+    });
+
+    return "saved_receipt";
+  } catch (error) {
+    console.error("PDF receipt handler failed", {
+      studentId: student.id,
+      messageId: message.id.toString(),
+      error: getErrorMessage(error),
+    });
+    throw error;
+  } finally {
+    if (!receiptSaved) {
+      await fs.rm(tempPath, { force: true });
+    }
+  }
 }
 
 type ProcessingSource = "event" | "polling";
@@ -298,9 +647,21 @@ type ProcessingAction =
 type StoredTelegramMessage = {
   id: number;
   processing_status: string | null;
+  has_media: number;
+  media_type: string | null;
+  processed_at: string | null;
+  created_at: string;
 };
 
 type StudentReplyIntent = "ready" | "cancel" | "cancellation_reason" | "unknown";
+
+function isLessonCancelledStatus(status: string): boolean {
+  return (
+    status === "cancelled" ||
+    status === "cancelled_by_student" ||
+    status === "cancelled_by_teacher"
+  );
+}
 
 function normalizeReplyText(text: string): string {
   return text
@@ -321,7 +682,13 @@ function parseStudentReplyIntent(text: string): Exclude<StudentReplyIntent, "can
     "отменить",
     "нужно отменить",
     "я не смогу",
+    "не смогу прийти",
     "не готов",
+    "عاوز ألغي",
+    "عايز الغي",
+    "عاوز الغي",
+    "مش هقدر",
+    "لا أستطيع",
   ]);
   const readyPhrases = new Set([
     "1",
@@ -339,15 +706,59 @@ function parseStudentReplyIntent(text: string): Exclude<StudentReplyIntent, "can
 
   if (
     cancellationPhrases.has(normalized) ||
+    normalized.includes("отмен") ||
     normalized.includes("не готов") ||
     normalized.includes("не могу") ||
-    normalized.includes("не смогу")
+    normalized.includes("не смогу") ||
+    normalized.includes("не получится") ||
+    normalized.includes("عاوز ألغي") ||
+    normalized.includes("عايز الغي") ||
+    normalized.includes("عاوز الغي") ||
+    normalized.includes("مش هقدر") ||
+    normalized.includes("لا أستطيع")
   ) {
     return "cancel";
   }
 
   if (readyPhrases.has(normalized)) {
     return "ready";
+  }
+
+  return "unknown";
+}
+
+function extractCancellationReasonFromCancellationText(text: string): string | null {
+  const trimmed = text.trim();
+  const normalized = normalizeReplyText(trimmed);
+  const commandOnlyPhrases = new Set([
+    "2",
+    "нет",
+    "отмена",
+    "отменить",
+    "нужно отменить",
+    "عاوز ألغي",
+    "عايز الغي",
+    "عاوز الغي",
+  ]);
+
+  if (!trimmed || commandOnlyPhrases.has(normalized)) {
+    return null;
+  }
+
+  return trimmed;
+}
+
+function parseExplicitCancellationReasonOverride(
+  text: string
+): Exclude<StudentReplyIntent, "cancellation_reason"> {
+  const normalized = normalizeReplyText(text);
+
+  if (normalized === "1") {
+    return "ready";
+  }
+
+  if (normalized === "2") {
+    return "cancel";
   }
 
   return "unknown";
@@ -378,9 +789,15 @@ function markTelegramMessageProcessed(
       WHERE id = ?
     `
   ).run(studentId, rowId);
+  console.log("message marked processed", {
+    telegramMessageRowId: rowId,
+    studentId,
+  });
 }
 
 function markTelegramMessageError(rowId: number, error: unknown): void {
+  const errorMessage = getErrorMessage(error);
+
   db.prepare(
     `
       UPDATE telegram_messages
@@ -389,10 +806,60 @@ function markTelegramMessageError(rowId: number, error: unknown): void {
           error = ?
       WHERE id = ?
     `
-  ).run(error instanceof Error ? error.message : "unknown error", rowId);
+  ).run(errorMessage, rowId);
+  console.log("message marked error", {
+    telegramMessageRowId: rowId,
+    error: errorMessage,
+  });
 }
 
-async function processTelegramMessage(
+function isStaleProcessingMessage(storedMessage: StoredTelegramMessage): boolean {
+  if (storedMessage.processing_status !== "processing") {
+    return false;
+  }
+
+  const referenceTime = Date.parse(
+    storedMessage.processed_at ?? storedMessage.created_at
+  );
+
+  return (
+    Number.isNaN(referenceTime) ||
+    Date.now() - referenceTime > staleProcessingMessageMs
+  );
+}
+
+function storedMessageAlreadyRepresentsPdf(
+  storedMessage: StoredTelegramMessage
+): boolean {
+  return (
+    storedMessage.has_media === 1 &&
+    (storedMessage.media_type === "application/pdf" ||
+      storedMessage.media_type?.toLowerCase().endsWith(".pdf") === true)
+  );
+}
+
+function refreshStoredMessageMedia(
+  rowId: number,
+  message: NewMessageEvent["message"],
+  document: Api.Document | undefined
+): void {
+  db.prepare(
+    `
+      UPDATE telegram_messages
+      SET has_media = ?,
+          media_type = ?,
+          text = COALESCE(?, text)
+      WHERE id = ?
+    `
+  ).run(
+    message.media ? 1 : 0,
+    document ? document.mimeType : message.media?.className ?? null,
+    message.message ?? null,
+    rowId
+  );
+}
+
+async function processTelegramMessageUnlocked(
   _client: TelegramClient,
   message: NewMessageEvent["message"],
   source: ProcessingSource
@@ -458,7 +925,7 @@ async function processTelegramMessage(
   const storedMessage = db
     .prepare(
       `
-        SELECT id, processing_status
+        SELECT id, processing_status, has_media, media_type, processed_at, created_at
         FROM telegram_messages
         WHERE telegram_chat_id = ?
           AND telegram_message_id = ?
@@ -466,14 +933,105 @@ async function processTelegramMessage(
     )
     .get(chatId, message.id.toString()) as StoredTelegramMessage;
 
+  console.log("existing telegram message found with status", {
+    source,
+    chat_id: chatId,
+    message_id: message.id.toString(),
+    sender_id: senderTelegramId,
+    message_type: messageType,
+    telegramMessageRowId: storedMessage.id,
+    processing_status: storedMessage.processing_status,
+    processed_at: storedMessage.processed_at,
+    media_type: storedMessage.media_type,
+  });
+
+  if (isStaleProcessingMessage(storedMessage)) {
+    console.log("stale processing message detected", {
+      source,
+      chat_id: chatId,
+      message_id: message.id.toString(),
+      sender_id: senderTelegramId,
+      message_type: messageType,
+      telegramMessageRowId: storedMessage.id,
+      created_at: storedMessage.created_at,
+      processed_at: storedMessage.processed_at,
+    });
+
+    db.prepare(
+      `
+        UPDATE telegram_messages
+        SET processing_status = 'pending',
+            processed_at = NULL,
+            error = 'stale processing message will be retried'
+        WHERE id = ?
+          AND processing_status = 'processing'
+      `
+    ).run(storedMessage.id);
+    storedMessage.processing_status = "pending";
+  }
+
   if (storedMessage.processing_status === "processed") {
-    console.log("Processed Telegram message", {
+    const currentMessageIsPdf = messageType === "pdf";
+
+    if (
+      currentMessageIsPdf &&
+      !storedMessageAlreadyRepresentsPdf(storedMessage)
+    ) {
+      refreshStoredMessageMedia(storedMessage.id, message, document);
+      db.prepare(
+        `
+          UPDATE telegram_messages
+          SET processing_status = 'pending',
+              processed_at = NULL,
+              error = NULL
+          WHERE id = ?
+        `
+      ).run(storedMessage.id);
+
+      console.log("processed message re-opened because PDF media is now available", {
+        source,
+        chat_id: chatId,
+        message_id: message.id.toString(),
+        sender_id: senderTelegramId,
+        previous_media_type: storedMessage.media_type,
+      });
+    } else {
+      console.log("duplicate message skipped", {
+        source,
+        chat_id: chatId,
+        message_id: message.id.toString(),
+        sender_id: senderTelegramId,
+        message_type: messageType,
+        action: "duplicate",
+        processing_status: storedMessage.processing_status,
+      });
+      return "duplicate";
+    }
+  }
+
+  if (storedMessage.processing_status === "error") {
+    console.log("duplicate message skipped", {
       source,
       chat_id: chatId,
       message_id: message.id.toString(),
       sender_id: senderTelegramId,
       message_type: messageType,
       action: "duplicate",
+      processing_status: storedMessage.processing_status,
+    });
+    return "duplicate";
+  }
+
+  if (storedMessage.processing_status === "processing") {
+    console.log("processing skipped because status is processing and not stale", {
+      source,
+      chat_id: chatId,
+      message_id: message.id.toString(),
+      sender_id: senderTelegramId,
+      message_type: messageType,
+      telegramMessageRowId: storedMessage.id,
+      processed_at: storedMessage.processed_at,
+      created_at: storedMessage.created_at,
     });
     return "duplicate";
   }
@@ -482,27 +1040,31 @@ async function processTelegramMessage(
     .prepare(
       `
         UPDATE telegram_messages
-        SET processing_status = 'processing'
+        SET processing_status = 'processing',
+            processed_at = datetime('now')
         WHERE id = ?
           AND (
             processing_status IS NULL
-            OR processing_status IN ('pending', 'error')
+            OR processing_status = 'pending'
           )
       `
     )
     .run(storedMessage.id);
 
   if (claimResult.changes === 0) {
-    console.log("Processed Telegram message", {
+    console.log("duplicate message skipped", {
       source,
       chat_id: chatId,
       message_id: message.id.toString(),
       sender_id: senderTelegramId,
       message_type: messageType,
       action: "duplicate",
+      processing_status: storedMessage.processing_status,
     });
     return "duplicate";
   }
+
+  refreshStoredMessageMedia(storedMessage.id, message, document);
 
   let student = findStudentByTelegramId(senderTelegramId);
   const senderUsername =
@@ -540,17 +1102,55 @@ async function processTelegramMessage(
   console.log(`Incoming message from student ${student.id}`);
 
   if (document) {
-    const action = await handlePdfReceipt(message, student, chatId, document);
-    markTelegramMessageProcessed(storedMessage.id, student.id);
-    console.log("Processed Telegram message", {
-      source,
-      chat_id: chatId,
-      message_id: message.id.toString(),
-      sender_id: senderTelegramId,
-      message_type: messageType,
-      action,
-    });
-    return action;
+    if (messageType === "pdf") {
+      console.log("new pdf message, starting receipt flow", {
+        source,
+        chat_id: chatId,
+        message_id: message.id.toString(),
+        sender_id: senderTelegramId,
+        studentId: student.id,
+      });
+    }
+
+    try {
+      const action = await handlePdfReceipt(
+        message,
+        student,
+        document,
+        storedMessage.id
+      );
+      markTelegramMessageProcessed(storedMessage.id, student.id);
+      console.log("Processed Telegram message", {
+        source,
+        chat_id: chatId,
+        message_id: message.id.toString(),
+        sender_id: senderTelegramId,
+        message_type: messageType,
+        action,
+      });
+      return action;
+    } catch (error) {
+      markTelegramMessageError(storedMessage.id, error);
+      console.error("PDF receipt flow failed; message marked error", {
+        source,
+        chat_id: chatId,
+        message_id: message.id.toString(),
+        sender_id: senderTelegramId,
+        message_type: messageType,
+        studentId: student.id,
+        error: getErrorMessage(error),
+      });
+      return "ignored";
+    } finally {
+      console.log("PDF receipt flow finished", {
+        source,
+        chat_id: chatId,
+        message_id: message.id.toString(),
+        sender_id: senderTelegramId,
+        message_type: messageType,
+        studentId: student.id,
+      });
+    }
   }
 
   const lesson = findNearestRemindedLesson(student.id);
@@ -561,10 +1161,26 @@ async function processTelegramMessage(
   }
 
   const text = message.message?.trim() ?? "";
-  let intent: StudentReplyIntent = parseStudentReplyIntent(text);
+  let intent: StudentReplyIntent;
 
-  if (intent === "unknown" && lesson.awaiting_cancellation_reason === 1 && text) {
-    intent = "cancellation_reason";
+  if (lesson.awaiting_cancellation_reason === 1 && text) {
+    intent = parseExplicitCancellationReasonOverride(text);
+
+    if (intent === "unknown") {
+      intent = "cancellation_reason";
+    }
+  } else {
+    intent = parseStudentReplyIntent(text);
+
+    if (intent === "ready" || intent === "cancel") {
+      console.log("Student reply parsed by rules", {
+        studentId: student.id,
+        lessonId: lesson.id,
+        intent,
+        confidence: 1,
+        reason: "deterministic rule match",
+      });
+    }
   }
 
   console.log("Parsed student reply intent", {
@@ -578,7 +1194,9 @@ async function processTelegramMessage(
       `
         UPDATE lessons
         SET awaiting_cancellation_reason = 0,
+            cancellation_source = 'student',
             cancellation_reason = ?,
+            cancellation_requested_at = COALESCE(cancellation_requested_at, datetime('now')),
             updated_at = datetime('now')
         WHERE id = ?
       `
@@ -596,9 +1214,43 @@ async function processTelegramMessage(
   }
 
   if (intent === "unknown") {
-    console.log("Ignored non-command non-PDF message");
-    markTelegramMessageProcessed(storedMessage.id, student.id);
-    return "ignored";
+    try {
+      const aiResult = await analyzeStudentReplyIntent({
+        text,
+        studentName: student.name_ru ?? student.name_ar ?? undefined,
+        lessonStartTime: lesson.start_time,
+      });
+
+      console.log("Student reply parsed by AI", {
+        studentId: student.id,
+        lessonId: lesson.id,
+        intent: aiResult.intent,
+        confidence: aiResult.confidence,
+        reason: aiResult.reason,
+      });
+
+      if (
+        aiResult.confidence >= minimumStudentReplyAiConfidence &&
+        (aiResult.intent === "ready" || aiResult.intent === "cancel")
+      ) {
+        intent = aiResult.intent;
+      }
+    } catch (error) {
+      console.error("Student reply AI parsing failed", {
+        studentId: student.id,
+        lessonId: lesson.id,
+        error: error instanceof Error ? error.message : "unknown error",
+      });
+    }
+
+    if (intent === "unknown") {
+      await message.respond({
+        message: studentReplyClarificationMessage,
+      });
+      console.log("Ignored non-command non-PDF message");
+      markTelegramMessageProcessed(storedMessage.id, student.id);
+      return "ignored";
+    }
   }
 
   if (intent === "ready") {
@@ -611,10 +1263,7 @@ async function processTelegramMessage(
       return "ignored";
     }
 
-    if (
-      lesson.status === "cancelled_by_student" ||
-      lesson.status === "cancelled_by_teacher"
-    ) {
+    if (isLessonCancelledStatus(lesson.status)) {
       await message.respond({
         message:
           "Урок уже отмечен как отменённый. Если нужно восстановить урок, напиши преподавателю напрямую.",
@@ -652,10 +1301,7 @@ async function processTelegramMessage(
     return "confirmed_lesson";
   }
 
-  if (
-    lesson.status === "cancelled_by_student" ||
-    lesson.status === "cancelled_by_teacher"
-  ) {
+  if (isLessonCancelledStatus(lesson.status)) {
     markTelegramMessageProcessed(storedMessage.id, student.id);
     return "ignored";
   }
@@ -664,19 +1310,26 @@ async function processTelegramMessage(
   const hoursUntilLesson = (lessonStartTime - Date.now()) / (60 * 60 * 1000);
 
   if (hoursUntilLesson <= cancellationDeadlineHours) {
+    const cancellationReason = extractCancellationReasonFromCancellationText(text);
+
     db.prepare(
       `
         UPDATE lessons
-        SET awaiting_cancellation_reason = 1,
-            cancellation_requested_at = datetime('now'),
+        SET awaiting_cancellation_reason = ?,
+            student_response = 'not_ready',
+            student_response_at = datetime('now'),
+            cancellation_source = 'student',
+            cancellation_reason = COALESCE(?, cancellation_reason),
+            cancellation_requested_at = COALESCE(cancellation_requested_at, datetime('now')),
             updated_at = datetime('now')
         WHERE id = ?
       `
-    ).run(lesson.id);
+    ).run(cancellationReason ? 0 : 1, cancellationReason, lesson.id);
 
     await message.respond({
-      message:
-        "К сожалению, я не могу автоматически отменить урок менее чем за 10 часов до начала.\n\nНапиши, пожалуйста, причину здесь — я посмотрю и отвечу вручную.",
+      message: cancellationReason
+        ? "Спасибо, я получил причину. Я посмотрю и отвечу вручную."
+        : "К сожалению, я не могу автоматически отменить урок менее чем за 10 часов до начала.\n\nНапиши, пожалуйста, причину здесь — я посмотрю и отвечу вручную.",
     });
 
     console.log("Cancellation blocked because less than 10 hours remain", {
@@ -690,10 +1343,12 @@ async function processTelegramMessage(
   db.prepare(
     `
       UPDATE lessons
-      SET status = 'cancelled_by_student',
+      SET status = 'cancelled',
           student_response = 'not_ready',
           student_response_at = datetime('now'),
           cancellation_source = 'student',
+          awaiting_cancellation_reason = 0,
+          cancellation_requested_at = COALESCE(cancellation_requested_at, datetime('now')),
           updated_at = datetime('now')
       WHERE id = ?
     `
@@ -706,6 +1361,38 @@ async function processTelegramMessage(
   console.log(`Lesson ${lesson.id} cancelled`);
   markTelegramMessageProcessed(storedMessage.id, student.id);
   return "cancelled_lesson";
+}
+
+async function processTelegramMessage(
+  client: TelegramClient,
+  message: NewMessageEvent["message"],
+  source: ProcessingSource
+): Promise<ProcessingAction> {
+  const chatId = message.chatId?.toString();
+  const messageId = message.id.toString();
+
+  if (!chatId) {
+    return processTelegramMessageUnlocked(client, message, source);
+  }
+
+  const lockKey = `${chatId}:${messageId}`;
+
+  if (activeTelegramMessageLocks.has(lockKey)) {
+    console.log("processing skipped because another handler is active", {
+      source,
+      chat_id: chatId,
+      message_id: messageId,
+    });
+    return "duplicate";
+  }
+
+  activeTelegramMessageLocks.add(lockKey);
+
+  try {
+    return await processTelegramMessageUnlocked(client, message, source);
+  } finally {
+    activeTelegramMessageLocks.delete(lockKey);
+  }
 }
 
 async function safelyProcessTelegramMessage(

@@ -25,6 +25,10 @@ export type ReceiptAiResult = {
   amount: number | null;
   currency: string | null;
   payment_date: string | null;
+  document_number: string | null;
+  operation_id: string | null;
+  recipient: string | null;
+  sender: string | null;
   confidence: number | null;
   reason: string;
 };
@@ -36,7 +40,7 @@ export type ReceiptAnalysisResult = {
   parsedAiResult: ReceiptAiResult;
 };
 
-async function extractTextFromPdf(pathToPdf: string): Promise<string> {
+export async function extractTextFromPdf(pathToPdf: string): Promise<string> {
   const data = await fs.readFile(pathToPdf);
   const parser = new PDFParse({ data });
 
@@ -56,6 +60,17 @@ The receipt text may be Russian.
 "₽" means RUB.
 Convert dates from DD.MM.YYYY to YYYY-MM-DD.
 If amount, date, or status cannot be clearly found, use null where appropriate and lower confidence.
+Extract stable receipt identifiers when present:
+- document_number, for example M70272139777 or document/check/receipt number
+- operation_id, transaction id, authorization id, or operation number
+- recipient and sender names when present
+
+Amount extraction rules:
+- Prefer the amount after labels: "Итого", "Сумма перевода", "Сумма операции", "Оплачено".
+- Ignore commission, cashback, card/account numbers, phone numbers, bank account fragments, MCC, timestamps, document numbers, correspondent account numbers.
+- Do not infer amount from random numeric fragments.
+- If multiple possible payment amounts exist, choose the final paid/total amount.
+- If uncertain, return payment_confirmed=false or confidence below 0.8.
 Return JSON only.
 Do not use markdown.
 Do not add explanation outside JSON.
@@ -64,9 +79,13 @@ Use exactly this JSON shape:
 {
   "is_payment_receipt": true,
   "payment_confirmed": true,
-  "amount": 300,
+  "amount": 5000,
   "currency": "RUB",
   "payment_date": "2026-05-15",
+  "document_number": "M70272139777",
+  "operation_id": null,
+  "recipient": "Recipient name",
+  "sender": "Sender name",
   "confidence": 0.92,
   "reason": "..."
 }
@@ -75,7 +94,7 @@ Receipt text:
 ${receiptText}`;
 }
 
-async function analyzeReceiptText(receiptText: string): Promise<ReceiptAiResult> {
+export async function analyzeReceiptText(receiptText: string): Promise<ReceiptAiResult> {
   if (!apiKey || !model) {
     throw new Error("Missing OPENROUTER_API_KEY or OPENROUTER_MODEL");
   }

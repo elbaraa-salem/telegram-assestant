@@ -13,8 +13,8 @@
       <th>Student response</th>
       <th>Cancellation reason</th>
       <th>Payment status</th>
-      <th>Payment method</th>
-      <th>Package progress</th>
+      <!-- <th>Payment method</th>
+      <th>Package progress</th> -->
       <th>AI receipt analysis</th>
       <th>Action</th>
     </tr>
@@ -25,18 +25,40 @@
         <td><%= lesson.id %></td>
         <!-- <td><%= lesson.title %></td> -->
         <td><%= lesson.name_ru %></td>
-        <td><%= lesson.start_time %></td>
+        <td>
+          <%= lesson.formattedStartTime.date %><br>
+          <%= lesson.formattedStartTime.time %>
+        </td>
         <td><%= lesson.status %></td>
         <td><%= lesson.student_response %></td>
         <td>
+          <% if (lesson.cancellation_source) { %>
+            Cancellation source: <%= lesson.cancellation_source %><br>
+          <% } %>
           <% if (lesson.cancellation_reason) { %>
-            <%= lesson.cancellation_reason %><br>
+            <div class="notice notice-warning">
+              <strong>Student requested cancellation</strong><br>
+              Reason: <%= lesson.cancellation_reason %>
+              <% if (lesson.cancellation_requested_at) { %>
+                <br>Requested at: <%= lesson.cancellation_requested_at %>
+              <% } %>
+            </div>
             <!-- Cancellation requested at: <%= lesson.cancellation_requested_at %> -->
+          <% } else if (lesson.hasCancellationRequest) { %>
+            <div class="notice notice-warning">
+              <strong>Student requested cancellation</strong><br>
+              Waiting for reason.
+            </div>
           <% } %>
         </td>
-        <td><%= lesson.payment_status %></td>
-        <td><%= lesson.payment_method %></td>
-        <td><%= lesson.packageProgress %></td>
+        <td>
+          <%= lesson.payment_status === "paid" ? "paid / covered by balance" : (lesson.payment_status || "") %>
+          <% if (lesson.charge_amount !== null) { %>
+            <br><%= lesson.charge_paid_amount %> / <%= lesson.charge_amount %>
+          <% } %>
+        </td>
+        <!-- <td><%= lesson.payment_method %></td>
+        <td><%= lesson.packageProgress %></td> -->
         <td>
           <% if (!lesson.aiReceipt.hasReceipt) { %>
             No receipt
@@ -64,7 +86,10 @@
               <button class="button" type="submit">تم الدرس</button>
             </form>
           <% } %>
-          <% if (lesson.payment_status === "confirmed") { %>
+          <% if (lesson.canCancel) { %>
+            <a class="button button-danger" href="/lessons/<%= lesson.id %>/cancel">إلغاء الدرس</a>
+          <% } %>
+          <% if (lesson.payment_status === "paid") { %>
             مدفوع
           <% } else if (lesson.canConfirmPayment) { %>
             <form method="post" action="/lessons/<%= lesson.id %>/confirm-payment">

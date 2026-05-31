@@ -1,0 +1,66 @@
+<section class="page-header">
+  <h1>Edit student</h1>
+</section>
+
+<form class="card form" method="post" action="/students/<%= student.id %>/edit">
+  <h2>Student data</h2>
+
+  <label>
+    Russian name
+    <input name="name_ru" value="<%= student.name_ru %>">
+  </label>
+
+  <label>
+    Arabic name
+    <input name="name_ar" value="<%= student.name_ar %>">
+  </label>
+
+  <label>
+    Telegram username
+    <input name="telegram_username" value="<%= student.telegram_username || "" %>">
+  </label>
+
+  <label>
+    Telegram ID
+    <input name="telegram_id" value="<%= student.telegram_id || "" %>">
+  </label>
+
+  <label>
+    Calendar keyword
+    <input name="calendar_keyword" value="<%= student.calendar_keyword %>" required>
+  </label>
+
+  <label class="checkbox-row">
+    <input
+      type="checkbox"
+      name="is_active"
+      value="1"
+      <%= student.is_active ? "checked" : "" %>
+    >
+    Active
+  </label>
+
+  <label>
+    Lesson price
+    <input
+      name="lesson_price_amount"
+      type="number"
+      min="0"
+      step="1"
+      value="<%= student.lesson_price_amount %>"
+      required
+    >
+  </label>
+
+  <label>
+    Currency
+    <input name="lesson_price_currency" value="<%= student.lesson_price_currency || "RUB" %>">
+  </label>
+
+  <p class="help-text">Price changes affect future lesson charges only.</p>
+
+  <div class="form-actions">
+    <button class="button" type="submit">Save changes</button>
+    <a class="button button-secondary" href="/students">Back</a>
+  </div>
+</form>

@@ -1,7 +1,14 @@
 import { db } from "../database/db";
 import { getTelegramClient } from "./telegramClient";
+import {
+  confirmSingleLessonChargeManually,
+  createLessonChargeForCompletedLesson,
+  createManualPaymentAndApply,
+  getStudentBalanceSummary,
+} from "./paymentBalanceService";
 
 const protectedStatuses = new Set([
+  "cancelled",
   "cancelled_by_student",
   "cancelled_by_teacher",
 ]);
@@ -11,13 +18,6 @@ type CompletionRow = {
   lesson_status: string;
   student_id: number;
   telegram_username: string | null;
-  payment_id: number;
-};
-
-type ActivePackage = {
-  id: number;
-  total_lessons: number;
-  used_lessons: number;
 };
 
 function cleanTelegramTarget(username: string | null): string | null {
@@ -56,6 +56,45 @@ async function sendStudentMessage(
   }
 }
 
+function buildDebtMessage(unpaidLessonsCount: number, unpaidAmount: number, currency: string): string {
+  const lessonWord =
+    unpaidLessonsCount === 1 ? "неоплаченный урок" : "неоплаченные уроки";
+
+  return `Урок отмечен как проведён ✅
+
+У вас есть ${lessonWord}: ${unpaidLessonsCount}.
+Сумма к оплате: ${unpaidAmount} ${currency}.
+
+Пожалуйста, отправьте чек PDF-файлом.`;
+}
+
+function formatLessonCountRu(count: number): string {
+  const absoluteCount = Math.abs(count);
+  const lastTwoDigits = absoluteCount % 100;
+  const lastDigit = absoluteCount % 10;
+
+  if (lastTwoDigits >= 11 && lastTwoDigits <= 14) {
+    return `${count} уроков`;
+  }
+
+  if (lastDigit === 1) {
+    return `${count} урок`;
+  }
+
+  if (lastDigit >= 2 && lastDigit <= 4) {
+    return `${count} урока`;
+  }
+
+  return `${count} уроков`;
+}
+
+function buildPrepaidMessage(prepaidLessonsCount: number): string {
+  return `Урок отмечен как проведён ✅
+
+Оплата списана из вашего баланса.
+Осталось оплаченных уроков: ${formatLessonCountRu(prepaidLessonsCount)}.`;
+}
+
 export async function completeLesson(lessonId: number): Promise<boolean> {
   const lesson = db
     .prepare(
@@ -64,11 +103,9 @@ export async function completeLesson(lessonId: number): Promise<boolean> {
           lessons.id AS lesson_id,
           lessons.status AS lesson_status,
           students.id AS student_id,
-          students.telegram_username,
-          payments.id AS payment_id
+          students.telegram_username
         FROM lessons
         JOIN students ON students.id = lessons.student_id
-        JOIN payments ON payments.lesson_id = lessons.id
         WHERE lessons.id = ?
       `
     )
@@ -82,30 +119,7 @@ export async function completeLesson(lessonId: number): Promise<boolean> {
     return false;
   }
 
-  let consumedPackage:
-    | {
-        usedLessons: number;
-        totalLessons: number;
-        remainingLessons: number;
-        completed: boolean;
-      }
-    | undefined;
-
-  const completeTransaction = db.transaction(() => {
-    const activePackage = db
-      .prepare(
-        `
-          SELECT id, total_lessons, used_lessons
-          FROM lesson_packages
-          WHERE student_id = ?
-            AND status = 'active'
-            AND used_lessons < total_lessons
-          ORDER BY created_at ASC, id ASC
-          LIMIT 1
-        `
-      )
-      .get(lesson.student_id) as ActivePackage | undefined;
-
+  const completionResult = db.transaction(() => {
     db.prepare(
       `
         UPDATE lessons
@@ -115,87 +129,47 @@ export async function completeLesson(lessonId: number): Promise<boolean> {
       `
     ).run(lessonId);
 
-    if (activePackage) {
-      const usedLessons = activePackage.used_lessons + 1;
-      const completed = usedLessons >= activePackage.total_lessons;
-
-      db.prepare(
-        `
-          UPDATE lesson_packages
-          SET used_lessons = ?,
-              status = ?,
-              updated_at = datetime('now')
-          WHERE id = ?
-        `
-      ).run(
-        usedLessons,
-        completed ? "completed" : "active",
-        activePackage.id
-      );
-
-      db.prepare(
-        `
-          UPDATE payments
-          SET status = 'confirmed',
-              paid_at = datetime('now'),
-              prepaid_package_id = ?,
-              payment_method = 'package',
-              updated_at = datetime('now')
-          WHERE id = ?
-        `
-      ).run(activePackage.id, lesson.payment_id);
-
-      consumedPackage = {
-        usedLessons,
-        totalLessons: activePackage.total_lessons,
-        remainingLessons: activePackage.total_lessons - usedLessons,
-        completed,
-      };
-      return;
-    }
+    const charge = createLessonChargeForCompletedLesson(lessonId);
+    const summary = getStudentBalanceSummary(lesson.student_id);
 
     db.prepare(
       `
         UPDATE lessons
-        SET payment_request_sent = 1
+        SET payment_request_sent = ?
         WHERE id = ?
       `
-    ).run(lessonId);
+    ).run(summary.unpaid_amount > 0 ? 1 : 0, lessonId);
 
-    db.prepare(
-      `
-        UPDATE payments
-        SET status = 'requested',
-            requested_at = datetime('now'),
-            updated_at = datetime('now')
-        WHERE id = ?
-      `
-    ).run(lesson.payment_id);
-  });
+    return { charge, summary };
+  })();
 
-  completeTransaction();
-
-  if (consumedPackage) {
-    const packageMessage = `Урок проведён ✅
-
-Списан 1 урок из оплаченного пакета.
-Использовано: ${consumedPackage.usedLessons} из ${consumedPackage.totalLessons}.
-Осталось: ${consumedPackage.remainingLessons}.${consumedPackage.completed ? "\nПакет закончился." : ""}`;
-
+  if (completionResult.summary.unpaid_amount > 0) {
     await sendStudentMessage(
       lesson.telegram_username,
-      packageMessage,
-      `Lesson ${lessonId} completed using package`
+      buildDebtMessage(
+        completionResult.summary.unpaid_lessons_count,
+        completionResult.summary.unpaid_amount,
+        completionResult.summary.currency
+      ),
+      `Lesson ${lessonId} completed with debt`
     );
     return true;
   }
 
+  console.log("existing prepaid balance applied to completed lesson", {
+    lessonId,
+    studentId: lesson.student_id,
+    prepaidLessonsCount: completionResult.summary.prepaid_lessons_count,
+  });
+  console.log("payment request skipped because lesson was covered by balance", {
+    lessonId,
+    studentId: lesson.student_id,
+  });
+
   await sendStudentMessage(
     lesson.telegram_username,
-    `Урок отмечен как проведён ✅
-
-Пожалуйста, отправь чек об оплате за этот урок PDF-файлом.`,
-    `Lesson ${lessonId} completed`
+    buildPrepaidMessage(completionResult.summary.prepaid_lessons_count),
+    `Lesson ${lessonId} completed using balance`
   );
 
   return true;
@@ -207,11 +181,9 @@ export async function confirmLessonPayment(lessonId: number): Promise<boolean> {
       `
         SELECT
           lessons.id AS lesson_id,
-          students.telegram_username,
-          payments.id AS payment_id
+          students.telegram_username
         FROM lessons
         JOIN students ON students.id = lessons.student_id
-        JOIN payments ON payments.lesson_id = lessons.id
         WHERE lessons.id = ?
       `
     )
@@ -219,7 +191,6 @@ export async function confirmLessonPayment(lessonId: number): Promise<boolean> {
     | {
         lesson_id: number;
         telegram_username: string | null;
-        payment_id: number;
       }
     | undefined;
 
@@ -227,18 +198,11 @@ export async function confirmLessonPayment(lessonId: number): Promise<boolean> {
     return false;
   }
 
-  db.transaction(() => {
-    db.prepare(
-      `
-        UPDATE payments
-        SET status = 'confirmed',
-            paid_at = datetime('now'),
-            payment_method = 'manual',
-            updated_at = datetime('now')
-        WHERE id = ?
-      `
-    ).run(lesson.payment_id);
-  })();
+  const result = confirmSingleLessonChargeManually(lessonId);
+
+  if (!result) {
+    return false;
+  }
 
   await sendStudentMessage(
     lesson.telegram_username,
@@ -247,4 +211,12 @@ export async function confirmLessonPayment(lessonId: number): Promise<boolean> {
   );
 
   return true;
+}
+
+export function addManualStudentPayment(
+  studentId: number,
+  amount: number,
+  currency: string
+) {
+  return createManualPaymentAndApply(studentId, amount, currency);
 }

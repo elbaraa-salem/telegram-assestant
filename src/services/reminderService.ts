@@ -4,9 +4,11 @@ import { fileURLToPath } from "node:url";
 import { db } from "../database/db";
 import { getTelegramClient } from "./telegramClient";
 import { resolveMissingTelegramIds } from "./telegramIdentityService";
+import { getStudentBalanceSummary } from "./paymentBalanceService";
 
 type ReminderLesson = {
   lesson_id: number;
+  student_id: number;
   start_time: string;
   name_ru: string;
   telegram_username: string | null;
@@ -83,6 +85,14 @@ function formatLessonDate(startTime: string): {
 
 function buildReminderMessage(lesson: ReminderLesson): string {
   const { weekday, day, month, time } = formatLessonDate(lesson.start_time);
+  const balance = getStudentBalanceSummary(lesson.student_id);
+  const debtMessage =
+    balance.unpaid_amount > 0
+      ? `
+
+Также напоминаю: у вас есть неоплаченные уроки: ${balance.unpaid_lessons_count}.
+Сумма: ${balance.unpaid_amount} ${balance.currency}.`
+      : "";
 
   return `Привет, ${lesson.name_ru} 👋
 
@@ -92,7 +102,7 @@ function buildReminderMessage(lesson: ReminderLesson): string {
 1 — да, я готов
 2 — нет, нужно отменить
 
-Можно ответить цифрой или словами.`;
+Можно ответить цифрой или словами.${debtMessage}`;
 }
 
 export async function sendLessonReminders(): Promise<ReminderResult> {
@@ -110,6 +120,7 @@ export async function sendLessonReminders(): Promise<ReminderResult> {
       `
         SELECT
           lessons.id AS lesson_id,
+          students.id AS student_id,
           lessons.start_time,
           students.name_ru,
           students.telegram_username,

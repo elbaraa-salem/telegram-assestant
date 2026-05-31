@@ -16,10 +16,13 @@ const tokenPath = path.join(process.cwd(), "config", "google-token.json");
 const protectedLessonStatuses = new Set([
   "completed",
   "confirmed",
+  "cancelled",
   "cancelled_by_teacher",
   "cancelled_by_student",
 ]);
 const defaultLessonMarkers = ["درس", "مذاكرة", "урок", "lesson"];
+const invalidGoogleTokenMessage =
+  "Google token is invalid or expired. Run npm run google:auth.";
 
 type Student = {
   id: number;
@@ -77,6 +80,24 @@ type SyncWindow = {
   timeMax: string;
   maxResults: number;
 };
+
+function isInvalidGrantError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return String(error).includes("invalid_grant");
+  }
+
+  const candidate = error as {
+    message?: unknown;
+    response?: {
+      data?: unknown;
+    };
+  };
+
+  return (
+    String(candidate.message ?? "").includes("invalid_grant") ||
+    JSON.stringify(candidate.response?.data ?? {}).includes("invalid_grant")
+  );
+}
 
 function getPositiveIntegerEnv(name: string, fallback: number): number {
   const rawValue = process.env[name];
@@ -274,16 +295,6 @@ export async function syncCalendarLessons(): Promise<SyncResult> {
     `
   );
 
-  const insertPayment = db.prepare(
-    `
-      INSERT OR IGNORE INTO payments (
-        lesson_id,
-        student_id
-      )
-      VALUES (?, ?)
-    `
-  );
-
   const result: SyncResult = {
     timeMin: syncWindow.timeMin,
     timeMax: syncWindow.timeMax,
@@ -367,13 +378,11 @@ export async function syncCalendarLessons(): Promise<SyncResult> {
     const googleStatus = event.status ?? null;
     const updatedAt = new Date().toISOString();
     let lessonId: number;
-    let paymentStudentId = student.id;
     let action: MatchedEventDetail["action"];
     let paymentCreated = false;
 
     if (existingLesson) {
       lessonId = existingLesson.id;
-      paymentStudentId = existingLesson.student_id ?? student.id;
 
       if (protectedLessonStatuses.has(existingLesson.status)) {
         result.skippedProtectedLessons += 1;
@@ -400,7 +409,6 @@ export async function syncCalendarLessons(): Promise<SyncResult> {
             lessonId
           );
         }
-        paymentStudentId = student.id;
         if (!dryRun) {
           result.updatedLessons += 1;
         }
@@ -410,7 +418,6 @@ export async function syncCalendarLessons(): Promise<SyncResult> {
 
       result.wouldInsertLessons += 1;
       if (dryRun) {
-        result.wouldCreatePayments += 1;
         result.matchedEventDetails.push({
           eventId: googleEventId,
           title,
@@ -421,7 +428,7 @@ export async function syncCalendarLessons(): Promise<SyncResult> {
           lessonMarker,
           action: "inserted",
           lessonId: null,
-          paymentCreated: true,
+          paymentCreated: false,
         });
         return;
       }
@@ -440,19 +447,6 @@ export async function syncCalendarLessons(): Promise<SyncResult> {
       lessonId = Number(insertResult.lastInsertRowid);
       result.insertedLessons += 1;
       action = "inserted";
-    }
-
-    const existingPayment = db
-      .prepare("SELECT id FROM payments WHERE lesson_id = ?")
-      .get(lessonId);
-
-    if (!existingPayment) {
-      result.wouldCreatePayments += 1;
-      if (!dryRun) {
-        const paymentResult = insertPayment.run(lessonId, paymentStudentId);
-        result.createdPayments += paymentResult.changes;
-        paymentCreated = paymentResult.changes > 0;
-      }
     }
 
     result.matchedEventDetails.push({
@@ -504,8 +498,34 @@ async function main() {
       console.log({ matchedEventDetails });
     }
   } catch (error) {
+    if (isInvalidGrantError(error)) {
+      console.error(invalidGoogleTokenMessage);
+      process.exit(1);
+    }
+
     console.error("Calendar sync failed:");
-    console.error(error);
+    if (error && typeof error === "object") {
+      const safeError = error as {
+        name?: unknown;
+        message?: unknown;
+        code?: unknown;
+        status?: unknown;
+      };
+
+      console.error({
+        name: safeError.name,
+        message: safeError.message,
+        code: safeError.code,
+        status: safeError.status,
+      });
+    } else {
+      console.error({
+        name: undefined,
+        message: String(error),
+        code: undefined,
+        status: undefined,
+      });
+    }
     process.exit(1);
   }
 }

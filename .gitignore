@@ -3,18 +3,10 @@ dist
 .env
 google-token.json
 google-credentials.json
+config/google-credentials.json
+config/google-token.json
 *.session
-data/*.db
 data/*.db-journal
-
-data/*.db
-data/*.db-shm
-data/*.db-wal
-data/receipts/*.pdf
-data/backups/
-data/corrupt/
-data/.fuse_hidden*
-src/web/public/styles/main.css.map
 
 # Runtime database files
 data/*.db

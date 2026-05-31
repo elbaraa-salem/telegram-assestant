@@ -66,6 +66,8 @@ db.exec(`
     awaiting_cancellation_reason INTEGER NOT NULL DEFAULT 0,
     cancellation_reason TEXT,
     cancellation_requested_at TEXT,
+    cancellation_confirmed_at TEXT,
+    cancellation_confirmed_by TEXT DEFAULT 'admin',
     ai_cancellation_confidence REAL,
 
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -77,7 +79,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS payments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
 
-    lesson_id INTEGER NOT NULL UNIQUE,
+    lesson_id INTEGER,
     student_id INTEGER NOT NULL,
 
     status TEXT NOT NULL DEFAULT 'unpaid',
@@ -177,9 +179,6 @@ db.exec(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_lessons_google_event_id
     ON lessons(google_event_id);
 
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_lesson_id
-    ON payments(lesson_id);
-
   CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_messages_chat_message
     ON telegram_messages(telegram_chat_id, telegram_message_id);
 `);
@@ -215,13 +214,233 @@ function addPaymentColumnIfMissing(columnName: string, definition: string): void
   db.exec(`ALTER TABLE payments ADD COLUMN ${definition}`);
 }
 
+function tableExists(tableName: string): boolean {
+  const row = db
+    .prepare(
+      `
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = ?
+      `
+    )
+    .get(tableName) as { name: string } | undefined;
+
+  return Boolean(row);
+}
+
+function migratePaymentsTableIfNeeded(): void {
+  const columns = db.prepare("PRAGMA table_info(payments)").all() as Array<{
+    name: string;
+    notnull: number;
+  }>;
+  const columnNames = new Set(columns.map((column) => column.name));
+  const selectColumn = (columnName: string): string =>
+    columnNames.has(columnName) ? columnName : "NULL";
+  const lessonIdColumn = columns.find((column) => column.name === "lesson_id");
+  const indexes = db.prepare("PRAGMA index_list(payments)").all() as Array<{
+    name: string;
+    unique: number;
+  }>;
+  const hasUniqueLessonIndex = indexes.some(
+    (index) => index.unique === 1 && index.name === "idx_payments_lesson_id"
+  );
+
+  if (lessonIdColumn?.notnull !== 1 && !hasUniqueLessonIndex) {
+    return;
+  }
+
+  db.exec(`
+    DROP INDEX IF EXISTS idx_payments_lesson_id;
+
+    CREATE TABLE payments_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      lesson_id INTEGER,
+      student_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'unpaid',
+      amount INTEGER,
+      currency TEXT NOT NULL DEFAULT 'RUB',
+      requested_at TEXT,
+      receipt_received_at TEXT,
+      paid_at TEXT,
+      telegram_message_id TEXT,
+      telegram_file_id TEXT,
+      receipt_file_path TEXT,
+      receipt_text TEXT,
+      ai_amount REAL,
+      ai_currency TEXT,
+      ai_payment_date TEXT,
+      ai_confidence REAL,
+      ai_raw_result TEXT,
+      receipt_fingerprint TEXT,
+      receipt_document_number TEXT,
+      receipt_operation_id TEXT,
+      manage_spend_notified_at TEXT,
+      manage_spend_message_id TEXT,
+      manage_spend_notify_error TEXT,
+      prepaid_package_id INTEGER,
+      payment_method TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (lesson_id) REFERENCES lessons(id),
+      FOREIGN KEY (student_id) REFERENCES students(id)
+    );
+
+    INSERT INTO payments_new (
+      id,
+      lesson_id,
+      student_id,
+      status,
+      amount,
+      currency,
+      requested_at,
+      receipt_received_at,
+      paid_at,
+      telegram_message_id,
+      telegram_file_id,
+      receipt_file_path,
+      receipt_text,
+      ai_amount,
+      ai_currency,
+      ai_payment_date,
+      ai_confidence,
+      ai_raw_result,
+      receipt_fingerprint,
+      receipt_document_number,
+      receipt_operation_id,
+      manage_spend_notified_at,
+      manage_spend_message_id,
+      manage_spend_notify_error,
+      prepaid_package_id,
+      payment_method,
+      created_at,
+      updated_at
+    )
+    SELECT
+      id,
+      lesson_id,
+      student_id,
+      status,
+      amount,
+      currency,
+      requested_at,
+      receipt_received_at,
+      paid_at,
+      telegram_message_id,
+      telegram_file_id,
+      receipt_file_path,
+      ${selectColumn("receipt_text")},
+      ${selectColumn("ai_amount")},
+      ${selectColumn("ai_currency")},
+      ${selectColumn("ai_payment_date")},
+      ${selectColumn("ai_confidence")},
+      ${selectColumn("ai_raw_result")},
+      ${selectColumn("receipt_fingerprint")},
+      ${selectColumn("receipt_document_number")},
+      ${selectColumn("receipt_operation_id")},
+      ${selectColumn("manage_spend_notified_at")},
+      ${selectColumn("manage_spend_message_id")},
+      ${selectColumn("manage_spend_notify_error")},
+      ${selectColumn("prepaid_package_id")},
+      ${selectColumn("payment_method")},
+      created_at,
+      updated_at
+    FROM payments;
+
+    DROP TABLE payments;
+    ALTER TABLE payments_new RENAME TO payments;
+  `);
+}
+
+function migrateLessonChargesTableIfNeeded(): void {
+  if (!tableExists("lesson_charges")) {
+    return;
+  }
+
+  const columns = db.prepare("PRAGMA table_info(lesson_charges)").all() as Array<{
+    name: string;
+    notnull: number;
+  }>;
+  const lessonIdColumn = columns.find((column) => column.name === "lesson_id");
+  const hasChargeType = columns.some((column) => column.name === "charge_type");
+  const hasNote = columns.some((column) => column.name === "note");
+
+  if (lessonIdColumn?.notnull !== 1 && hasChargeType && hasNote) {
+    return;
+  }
+
+  const chargeTypeSelect = hasChargeType
+    ? "COALESCE(charge_type, 'lesson')"
+    : "'lesson'";
+  const noteSelect = hasNote ? "note" : "NULL";
+
+  db.exec(`
+    CREATE TABLE lesson_charges_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      lesson_id INTEGER UNIQUE,
+      student_id INTEGER NOT NULL,
+      charge_type TEXT NOT NULL DEFAULT 'lesson',
+      amount INTEGER NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'RUB',
+      status TEXT NOT NULL DEFAULT 'unpaid',
+      paid_amount INTEGER NOT NULL DEFAULT 0,
+      note TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (lesson_id) REFERENCES lessons(id),
+      FOREIGN KEY (student_id) REFERENCES students(id)
+    );
+
+    INSERT INTO lesson_charges_new (
+      id,
+      lesson_id,
+      student_id,
+      charge_type,
+      amount,
+      currency,
+      status,
+      paid_amount,
+      note,
+      created_at,
+      updated_at
+    )
+    SELECT
+      id,
+      lesson_id,
+      student_id,
+      ${chargeTypeSelect},
+      amount,
+      currency,
+      status,
+      paid_amount,
+      ${noteSelect},
+      created_at,
+      updated_at
+    FROM lesson_charges;
+
+    DROP TABLE lesson_charges;
+    ALTER TABLE lesson_charges_new RENAME TO lesson_charges;
+  `);
+}
+
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response TEXT");
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response_at TEXT");
 addColumnIfMissing(
   "ALTER TABLE lessons ADD COLUMN awaiting_cancellation_reason INTEGER NOT NULL DEFAULT 0"
 );
+addColumnIfMissing("ALTER TABLE lessons ADD COLUMN cancellation_source TEXT");
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN cancellation_reason TEXT");
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN cancellation_requested_at TEXT");
+addColumnIfMissing("ALTER TABLE lessons ADD COLUMN cancellation_confirmed_at TEXT");
+addColumnIfMissing(
+  "ALTER TABLE lessons ADD COLUMN cancellation_confirmed_by TEXT DEFAULT 'admin'"
+);
+addColumnIfMissing(
+  "ALTER TABLE students ADD COLUMN lesson_price_amount INTEGER NOT NULL DEFAULT 0"
+);
+addColumnIfMissing(
+  "ALTER TABLE students ADD COLUMN lesson_price_currency TEXT NOT NULL DEFAULT 'RUB'"
+);
 addColumnIfMissing("ALTER TABLE payments ADD COLUMN prepaid_package_id INTEGER");
 addColumnIfMissing("ALTER TABLE payments ADD COLUMN payment_method TEXT");
 addColumnIfMissing("ALTER TABLE telegram_messages ADD COLUMN sender_id TEXT");
@@ -241,3 +460,70 @@ addPaymentColumnIfMissing("ai_currency", "ai_currency TEXT");
 addPaymentColumnIfMissing("ai_payment_date", "ai_payment_date TEXT");
 addPaymentColumnIfMissing("ai_confidence", "ai_confidence REAL");
 addPaymentColumnIfMissing("ai_raw_result", "ai_raw_result TEXT");
+addPaymentColumnIfMissing("receipt_fingerprint", "receipt_fingerprint TEXT");
+addPaymentColumnIfMissing("receipt_document_number", "receipt_document_number TEXT");
+addPaymentColumnIfMissing("receipt_operation_id", "receipt_operation_id TEXT");
+addPaymentColumnIfMissing("manage_spend_notified_at", "manage_spend_notified_at TEXT");
+addPaymentColumnIfMissing("manage_spend_message_id", "manage_spend_message_id TEXT");
+addPaymentColumnIfMissing("manage_spend_notify_error", "manage_spend_notify_error TEXT");
+
+migratePaymentsTableIfNeeded();
+migrateLessonChargesTableIfNeeded();
+
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_payments_lesson_id_lookup
+    ON payments(lesson_id);
+
+  UPDATE payments
+  SET telegram_message_id = NULL
+  WHERE telegram_message_id IS NOT NULL
+    AND id NOT IN (
+      SELECT MIN(id)
+      FROM payments
+      WHERE telegram_message_id IS NOT NULL
+      GROUP BY telegram_message_id
+    );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_telegram_message_id_unique
+    ON payments(telegram_message_id)
+    WHERE telegram_message_id IS NOT NULL;
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_receipt_fingerprint_unique
+    ON payments(receipt_fingerprint)
+    WHERE receipt_fingerprint IS NOT NULL;
+
+  CREATE TABLE IF NOT EXISTS lesson_charges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lesson_id INTEGER UNIQUE,
+    student_id INTEGER NOT NULL,
+    charge_type TEXT NOT NULL DEFAULT 'lesson',
+    amount INTEGER NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'RUB',
+    status TEXT NOT NULL DEFAULT 'unpaid',
+    paid_amount INTEGER NOT NULL DEFAULT 0,
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (lesson_id) REFERENCES lessons(id),
+    FOREIGN KEY (student_id) REFERENCES students(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS payment_allocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    payment_id INTEGER NOT NULL,
+    lesson_charge_id INTEGER NOT NULL,
+    amount INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (payment_id) REFERENCES payments(id),
+    FOREIGN KEY (lesson_charge_id) REFERENCES lesson_charges(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_lesson_charges_student_status
+    ON lesson_charges(student_id, status, created_at);
+
+  CREATE INDEX IF NOT EXISTS idx_payment_allocations_payment
+    ON payment_allocations(payment_id);
+
+  CREATE INDEX IF NOT EXISTS idx_payment_allocations_charge
+    ON payment_allocations(lesson_charge_id);
+`);
