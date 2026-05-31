@@ -5,9 +5,11 @@ import path from "node:path";
 
 process.env.APP_MODE = "production";
 process.env.ENABLE_TEST_SEED = "false";
-process.env.GOOGLE_AUTH_MODE = "service_account";
-process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE = "config/google-service-account.json";
-process.env.GOOGLE_CALENDAR_ID = "production-calendar@example.com";
+process.env.GOOGLE_AUTH_MODE = "oauth";
+process.env.GOOGLE_CREDENTIALS_FILE = "config/google-credentials.json";
+process.env.GOOGLE_TOKEN_FILE = "config/google-token.json";
+process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE = "";
+process.env.GOOGLE_CALENDAR_ID = "primary";
 process.env.CALENDAR_SYNC_LOOKAHEAD_DAYS = "30";
 process.env.CALENDAR_SYNC_LOOKBACK_DAYS = "7";
 
@@ -26,8 +28,8 @@ const {
 } = await import("../services/calendarSync");
 
 try {
-  assert.equal(getCalendarAuthMode(), "service_account");
-  assert.equal(getCalendarId(), "production-calendar@example.com");
+  assert.equal(getCalendarAuthMode(), "oauth");
+  assert.equal(getCalendarId(), "primary");
   assert.equal(isInvalidGrantError(new Error("invalid_grant")), true);
 
   await assert.rejects(

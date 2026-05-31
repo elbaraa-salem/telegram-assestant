@@ -5,12 +5,6 @@ import { fileURLToPath } from "node:url";
 import { google, calendar_v3 } from "googleapis";
 import { db } from "../database/db";
 
-const credentialsPath = path.join(
-  process.cwd(),
-  "config",
-  "google-credentials.json"
-);
-const tokenPath = path.join(process.cwd(), "config", "google-token.json");
 const serviceAccountDefaultPath = path.join(
   process.cwd(),
   "config",
@@ -174,6 +168,20 @@ export function getCalendarId(): string {
   return process.env.GOOGLE_CALENDAR_ID?.trim() || "primary";
 }
 
+function getGoogleCredentialsPath(): string {
+  return (
+    process.env.GOOGLE_CREDENTIALS_FILE?.trim() ||
+    path.join(process.cwd(), "config", "google-credentials.json")
+  );
+}
+
+function getGoogleTokenPath(): string {
+  return (
+    process.env.GOOGLE_TOKEN_FILE?.trim() ||
+    path.join(process.cwd(), "config", "google-token.json")
+  );
+}
+
 function createCalendarClient(): calendar_v3.Calendar {
   const authMode = getCalendarAuthMode();
 
@@ -194,8 +202,10 @@ function createCalendarClient(): calendar_v3.Calendar {
     });
   }
 
-  const credentials = JSON.parse(fs.readFileSync(credentialsPath, "utf8"));
-  const tokens = JSON.parse(fs.readFileSync(tokenPath, "utf8"));
+  const credentials = JSON.parse(
+    fs.readFileSync(getGoogleCredentialsPath(), "utf8")
+  );
+  const tokens = JSON.parse(fs.readFileSync(getGoogleTokenPath(), "utf8"));
   const clientInfo = credentials.installed ?? credentials.web;
 
   if (!clientInfo) {
