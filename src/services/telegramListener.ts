@@ -58,6 +58,7 @@ type Lesson = {
   id: number;
   start_time: string;
   status: string;
+  reminder_sent: number;
   student_response: string | null;
   awaiting_cancellation_reason: number;
   cancellation_reason: string | null;
@@ -74,6 +75,7 @@ function findNearestRemindedLesson(studentId: number): Lesson | null {
           id,
           start_time,
           status,
+          reminder_sent,
           student_response,
           awaiting_cancellation_reason,
           cancellation_reason
@@ -654,6 +656,15 @@ type StoredTelegramMessage = {
 };
 
 type StudentReplyIntent = "ready" | "cancel" | "cancellation_reason" | "unknown";
+type StudentMessageState =
+  | "awaiting_cancellation_reason"
+  | "awaiting_reminder_response"
+  | "passive";
+export type StudentTextClassification = {
+  state: StudentMessageState;
+  intent: StudentReplyIntent;
+  shouldSendUnknownReminderReply: boolean;
+};
 
 function isLessonCancelledStatus(status: string): boolean {
   return (
@@ -667,15 +678,18 @@ function normalizeReplyText(text: string): string {
   return text
     .trim()
     .toLocaleLowerCase()
+    .normalize("NFKC")
     .replace(/[.,!?،؛:;]/g, "")
     .replace(/\s+/g, " ");
 }
 
-function parseStudentReplyIntent(text: string): Exclude<StudentReplyIntent, "cancellation_reason"> {
-  const normalized = normalizeReplyText(text);
-  const cancellationPhrases = new Set([
-    "2",
-    "нет",
+function hasClearCancellationIntent(normalized: string): boolean {
+  if (normalized === "2") {
+    return true;
+  }
+
+  const exactCancellationPhrases = new Set([
+    "нет нужно отменить",
     "не могу",
     "не получится",
     "отмена",
@@ -684,47 +698,190 @@ function parseStudentReplyIntent(text: string): Exclude<StudentReplyIntent, "can
     "я не смогу",
     "не смогу прийти",
     "не готов",
-    "عاوز ألغي",
-    "عايز الغي",
-    "عاوز الغي",
     "مش هقدر",
+    "مش هقدر احضر",
+    "مش هقدر أحضر",
+    "لا استطيع",
     "لا أستطيع",
+    "لا استطيع الحضور",
+    "لن استطيع الحضور",
+    "لن أستطيع الحضور",
   ]);
+
+  if (exactCancellationPhrases.has(normalized)) {
+    return true;
+  }
+
+  return (
+    normalized.includes("отмени") ||
+    normalized.includes("отменить") ||
+    normalized.includes("отменим") ||
+    normalized.includes("отмена") ||
+    normalized.includes("отмену") ||
+    normalized.includes("cancel") ||
+    normalized.includes("не смогу") ||
+    normalized.includes("не успею") ||
+    normalized.includes("не получится") ||
+    normalized.includes("не выйдет") ||
+    ((normalized.includes("не могу") ||
+      normalized.includes("не получается")) &&
+      (normalized.includes("прийти") ||
+        normalized.includes("быть") ||
+        normalized.includes("попасть") ||
+        normalized.includes("успеть") ||
+        normalized.includes("заниматься"))) ||
+    normalized.includes("عاوز ألغي") ||
+    normalized.includes("عايز الغي") ||
+    normalized.includes("عاوز الغي") ||
+    normalized.includes("عاوزة الغي") ||
+    normalized.includes("عاوزة ألغي") ||
+    normalized.includes("الغي الدرس") ||
+    normalized.includes("ألغي الدرس") ||
+    normalized.includes("نلغي") ||
+    normalized.includes("إلغاء") ||
+    normalized.includes("الغاء") ||
+    normalized.includes("مش هقدر") ||
+    normalized.includes("لن استطيع") ||
+    normalized.includes("لن أستطيع") ||
+    normalized.includes("لا استطيع الحضور") ||
+    normalized.includes("لا أستطيع الحضور")
+  );
+}
+
+function hasClearReadyIntent(normalized: string): boolean {
   const readyPhrases = new Set([
     "1",
     "да",
     "да я готов",
+    "да я готова",
     "я готов",
+    "я готова",
     "готов",
+    "готова",
     "буду",
-    "ок",
-    "окей",
-    "хорошо",
     "+",
     "yes",
+    "نعم",
+    "نعم انا جاهز",
+    "نعم أنا جاهز",
+    "انا جاهز",
+    "أنا جاهز",
+    "انا جاهزة",
+    "أنا جاهزة",
+    "جاهز",
+    "جاهزة",
   ]);
 
-  if (
-    cancellationPhrases.has(normalized) ||
-    normalized.includes("отмен") ||
-    normalized.includes("не готов") ||
-    normalized.includes("не могу") ||
-    normalized.includes("не смогу") ||
-    normalized.includes("не получится") ||
-    normalized.includes("عاوز ألغي") ||
-    normalized.includes("عايز الغي") ||
-    normalized.includes("عاوز الغي") ||
-    normalized.includes("مش هقدر") ||
-    normalized.includes("لا أستطيع")
-  ) {
+  return readyPhrases.has(normalized);
+}
+
+function parseStudentReplyIntent(
+  text: string
+): Exclude<StudentReplyIntent, "cancellation_reason"> {
+  const normalized = normalizeReplyText(text);
+
+  if (hasClearCancellationIntent(normalized)) {
     return "cancel";
   }
 
-  if (readyPhrases.has(normalized)) {
+  if (hasClearReadyIntent(normalized)) {
     return "ready";
   }
 
   return "unknown";
+}
+
+function parseReminderReplyIntent(
+  text: string
+): Exclude<StudentReplyIntent, "cancellation_reason"> {
+  const normalized = normalizeReplyText(text);
+
+  if (normalized === "нет") {
+    return "cancel";
+  }
+
+  return parseStudentReplyIntent(text);
+}
+
+function isAwaitingReminderResponse(lesson: Lesson): boolean {
+  return (
+    lesson.reminder_sent === 1 &&
+    lesson.awaiting_cancellation_reason !== 1 &&
+    lesson.student_response === null &&
+    !isLessonCancelledStatus(lesson.status) &&
+    lesson.status !== "completed"
+  );
+}
+
+function getStudentMessageState(lesson: Lesson): StudentMessageState {
+  if (lesson.awaiting_cancellation_reason === 1) {
+    return "awaiting_cancellation_reason";
+  }
+
+  if (isAwaitingReminderResponse(lesson)) {
+    return "awaiting_reminder_response";
+  }
+
+  return "passive";
+}
+
+export function classifyStudentTextForLesson(
+  lesson: Lesson,
+  text: string
+): StudentTextClassification {
+  const state = getStudentMessageState(lesson);
+
+  if (state === "awaiting_cancellation_reason" && text.trim()) {
+    const overrideIntent = parseExplicitCancellationReasonOverride(text);
+
+    return {
+      state,
+      intent:
+        overrideIntent === "unknown" ? "cancellation_reason" : overrideIntent,
+      shouldSendUnknownReminderReply: false,
+    };
+  }
+
+  const intent =
+    state === "awaiting_reminder_response"
+      ? parseReminderReplyIntent(text)
+      : parseStudentReplyIntent(text);
+
+  return {
+    state,
+    intent,
+    shouldSendUnknownReminderReply:
+      intent === "unknown" &&
+      state === "awaiting_reminder_response" &&
+      isProbablyUnclearReminderReply(text),
+  };
+}
+
+function isProbablyUnclearReminderReply(text: string): boolean {
+  const normalized = normalizeReplyText(text);
+
+  if (!normalized) {
+    return false;
+  }
+
+  if (/^[12]?[+-]?$/.test(normalized)) {
+    return true;
+  }
+
+  if (normalized.length > 40) {
+    return false;
+  }
+
+  return (
+    normalized.includes("да") ||
+    normalized.includes("нет") ||
+    normalized.includes("готов") ||
+    normalized.includes("готова") ||
+    normalized.includes("могу") ||
+    normalized.includes("смогу") ||
+    normalized.includes("буду") ||
+    /\b(ok|okay|yes|no)\b/.test(normalized)
+  );
 }
 
 function extractCancellationReasonFromCancellationText(text: string): string | null {
@@ -1156,36 +1313,39 @@ async function processTelegramMessageUnlocked(
   const lesson = findNearestRemindedLesson(student.id);
 
   if (!lesson) {
+    console.log("message ignored as unrelated: no active reminded lesson", {
+      studentId: student.id,
+      messageType,
+    });
     markTelegramMessageProcessed(storedMessage.id, student.id);
     return "ignored";
   }
 
   const text = message.message?.trim() ?? "";
-  let intent: StudentReplyIntent;
+  const classification = classifyStudentTextForLesson(lesson, text);
+  let intent: StudentReplyIntent = classification.intent;
+  const messageState = classification.state;
 
-  if (lesson.awaiting_cancellation_reason === 1 && text) {
-    intent = parseExplicitCancellationReasonOverride(text);
-
-    if (intent === "unknown") {
-      intent = "cancellation_reason";
-    }
-  } else {
-    intent = parseStudentReplyIntent(text);
-
-    if (intent === "ready" || intent === "cancel") {
-      console.log("Student reply parsed by rules", {
+  if (intent === "ready" || intent === "cancel") {
+    console.log(
+      intent === "ready"
+        ? "message parsed as ready"
+        : "message parsed as cancellation request",
+      {
         studentId: student.id,
         lessonId: lesson.id,
+        messageState,
         intent,
         confidence: 1,
         reason: "deterministic rule match",
-      });
-    }
+      }
+    );
   }
 
   console.log("Parsed student reply intent", {
     studentId: student.id,
     lessonId: lesson.id,
+    messageState,
     intent,
   });
 
@@ -1205,7 +1365,7 @@ async function processTelegramMessageUnlocked(
     await message.respond({
       message: "Спасибо, я получил причину. Я посмотрю и отвечу вручную.",
     });
-    console.log("Cancellation reason saved", {
+    console.log("message saved as cancellation reason", {
       lessonId: lesson.id,
       studentId: student.id,
     });
@@ -1213,7 +1373,10 @@ async function processTelegramMessageUnlocked(
     return "cancellation_reason";
   }
 
-  if (intent === "unknown") {
+  if (
+    intent === "unknown" &&
+    classification.shouldSendUnknownReminderReply
+  ) {
     try {
       const aiResult = await analyzeStudentReplyIntent({
         text,
@@ -1247,18 +1410,41 @@ async function processTelegramMessageUnlocked(
       await message.respond({
         message: studentReplyClarificationMessage,
       });
-      console.log("Ignored non-command non-PDF message");
+      console.log("unknown reminder reply sent", {
+        studentId: student.id,
+        lessonId: lesson.id,
+        text,
+      });
       markTelegramMessageProcessed(storedMessage.id, student.id);
       return "ignored";
     }
   }
 
+  if (intent === "unknown") {
+    console.log(
+      messageState === "awaiting_reminder_response"
+        ? "message ignored as unrelated during pending reminder"
+        : "skipped unknown reply because no active pending reminder",
+      {
+        studentId: student.id,
+        lessonId: lesson.id,
+        messageState,
+        text,
+      }
+    );
+    markTelegramMessageProcessed(storedMessage.id, student.id);
+    return "ignored";
+  }
+
   if (intent === "ready") {
     if (
-      lesson.status === "confirmed" &&
+      !isAwaitingReminderResponse(lesson) &&
       lesson.student_response === "ready"
     ) {
-      console.log(`Ignored duplicate ready response for lesson ${lesson.id}`);
+      console.log("message parsed as ready; duplicate ready ignored", {
+        studentId: student.id,
+        lessonId: lesson.id,
+      });
       markTelegramMessageProcessed(storedMessage.id, student.id);
       return "ignored";
     }
@@ -1280,6 +1466,7 @@ async function processTelegramMessageUnlocked(
         SET status = 'confirmed',
             student_response = 'ready',
             student_response_at = datetime('now'),
+            awaiting_cancellation_reason = 0,
             updated_at = datetime('now')
         WHERE id = ?
       `
@@ -1335,6 +1522,8 @@ async function processTelegramMessageUnlocked(
     console.log("Cancellation blocked because less than 10 hours remain", {
       lessonId: lesson.id,
       studentId: student.id,
+      action: "message parsed as cancellation request",
+      awaitingCancellationReason: cancellationReason ? 0 : 1,
     });
     markTelegramMessageProcessed(storedMessage.id, student.id);
     return "ignored";
@@ -1358,7 +1547,10 @@ async function processTelegramMessageUnlocked(
     message: "Понял, отмену урока зафиксировал.",
   });
 
-  console.log(`Lesson ${lesson.id} cancelled`);
+  console.log("message parsed as cancellation request; lesson cancelled", {
+    lessonId: lesson.id,
+    studentId: student.id,
+  });
   markTelegramMessageProcessed(storedMessage.id, student.id);
   return "cancelled_lesson";
 }
