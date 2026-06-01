@@ -21,6 +21,10 @@ import { sendStudentWelcomeMessage } from "../services/studentWelcomeService";
 const app = express();
 const port = Number(process.env.ADMIN_PORT ?? 3000);
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
+const appMode = process.env.APP_MODE?.trim() || "development";
+const calendarSyncOnWebStart =
+  String(process.env.CALENDAR_SYNC_ON_WEB_START ?? "false").toLowerCase() ===
+  "true";
 
 type Student = {
   id: number;
@@ -1143,11 +1147,22 @@ app.post("/manual-debts", (request, response) => {
 
 app.listen(port, () => {
   console.log("app mode", {
-    appMode: process.env.APP_MODE?.trim() || "development",
+    appMode,
   });
   console.log("test seed enabled/disabled", {
     enabled:
       String(process.env.ENABLE_TEST_SEED ?? "false").toLowerCase() === "true",
   });
+  console.log("calendar sync on web start", {
+    enabled: calendarSyncOnWebStart,
+  });
   console.log(`Admin server listening on http://localhost:${port}`);
+
+  if (calendarSyncOnWebStart) {
+    void syncCalendarLessons().catch((error) => {
+      console.error("calendar sync failed on web start", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
 });
