@@ -328,6 +328,7 @@ async function writeDownloadResultToTempFile(
 }
 
 async function handlePdfReceipt(
+  client: TelegramClient,
   message: NewMessageEvent["message"],
   student: Student,
   document: Api.Document,
@@ -569,9 +570,11 @@ async function handlePdfReceipt(
 
     if (application.duplicate) {
       if (application.duplicateReason !== "telegram_message_id") {
-        await message.respond({
-          message: "Этот чек уже был учтён ранее ✅",
-        });
+        await safelySendStudentMessage(
+          client,
+          student,
+          "Этот чек уже был учтён ранее ✅"
+        );
       }
       return "ignored";
     }
@@ -613,9 +616,7 @@ async function handlePdfReceipt(
 Стоимость одного урока: ${application.lessonPriceAmount} ${application.currency}.
 На балансе: ${formatLessonCountRu(application.prepaidLessonsCount)}.`;
 
-    await message.respond({
-      message: responseMessage,
-    });
+    await safelySendStudentMessage(client, student, responseMessage);
     console.log("confirmation message sent once", {
       studentId: student.id,
       paymentId: application.paymentId,
@@ -665,6 +666,10 @@ export type StudentTextClassification = {
   intent: StudentReplyIntent;
   shouldSendUnknownReminderReply: boolean;
 };
+type EntityResolvingTelegramClient = Pick<
+  TelegramClient,
+  "getInputEntity" | "getDialogs"
+>;
 
 function isLessonCancelledStatus(status: string): boolean {
   return (
@@ -932,6 +937,105 @@ function getMessageType(
   return message.message?.trim() ? "text" : "other";
 }
 
+function isTelegramEntityResolveError(error: unknown): boolean {
+  const message = getErrorMessage(error);
+
+  return (
+    message.includes("Could not find the input entity") ||
+    message.includes("Cannot find any entity corresponding to") ||
+    message.includes("Could not find input entity")
+  );
+}
+
+function getStudentTelegramTargets(student: Student): string[] {
+  const targets = [
+    student.telegram_id?.trim(),
+    student.telegram_username?.trim(),
+  ].filter((target): target is string => Boolean(target));
+
+  return [...new Set(targets)];
+}
+
+export async function safeResolveInputEntity(
+  client: EntityResolvingTelegramClient,
+  targets: Array<string | null | undefined>
+): Promise<Api.TypeInputPeer | null> {
+  const cleanTargets = [
+    ...new Set(
+      targets
+        .map((target) => target?.trim())
+        .filter((target): target is string => Boolean(target))
+    ),
+  ];
+
+  for (const target of cleanTargets) {
+    try {
+      return await client.getInputEntity(target);
+    } catch (error) {
+      console.warn("telegram entity resolve failed; message skipped", {
+        target,
+        error: getErrorMessage(error),
+      });
+
+      if (!isTelegramEntityResolveError(error)) {
+        return null;
+      }
+    }
+  }
+
+  try {
+    await client.getDialogs({});
+  } catch (error) {
+    console.warn("telegram dialogs refresh failed during entity resolve", {
+      error: getErrorMessage(error),
+    });
+  }
+
+  for (const target of cleanTargets) {
+    try {
+      return await client.getInputEntity(target);
+    } catch (error) {
+      console.warn("telegram entity resolve failed after dialogs refresh", {
+        target,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  return null;
+}
+
+async function safelySendStudentMessage(
+  client: TelegramClient,
+  student: Student,
+  message: string
+): Promise<boolean> {
+  const entity = await safeResolveInputEntity(
+    client,
+    getStudentTelegramTargets(student)
+  );
+
+  if (!entity) {
+    console.warn("telegram reply skipped because student entity is unresolved", {
+      studentId: student.id,
+      telegramId: student.telegram_id ?? null,
+      telegramUsername: student.telegram_username ?? null,
+    });
+    return false;
+  }
+
+  try {
+    await client.sendMessage(entity, { message });
+    return true;
+  } catch (error) {
+    console.warn("telegram reply send failed; message skipped", {
+      studentId: student.id,
+      error: getErrorMessage(error),
+    });
+    return false;
+  }
+}
+
 function markTelegramMessageProcessed(
   rowId: number,
   studentId: number | null
@@ -1017,7 +1121,7 @@ function refreshStoredMessageMedia(
 }
 
 async function processTelegramMessageUnlocked(
-  _client: TelegramClient,
+  client: TelegramClient,
   message: NewMessageEvent["message"],
   source: ProcessingSource
 ): Promise<ProcessingAction> {
@@ -1041,11 +1145,10 @@ async function processTelegramMessageUnlocked(
     return "ignored";
   }
 
-  const sender = await message.getSender();
   const senderTelegramId = message.senderId?.toString();
-  const chatId = message.chatId?.toString();
+  const chatId = message.chatId?.toString() ?? senderTelegramId;
 
-  if (!sender || !senderTelegramId || !chatId) {
+  if (!senderTelegramId || !chatId) {
     return "ignored";
   }
 
@@ -1224,10 +1327,31 @@ async function processTelegramMessageUnlocked(
   refreshStoredMessageMedia(storedMessage.id, message, document);
 
   let student = findStudentByTelegramId(senderTelegramId);
-  const senderUsername =
-    sender instanceof Api.User && sender.username
-      ? normalizeTelegramUsername(sender.username)
-      : null;
+  let senderUsername: string | null = null;
+
+  if (!student) {
+    try {
+      const sender = await message.getSender();
+      senderUsername =
+        sender instanceof Api.User && sender.username
+          ? normalizeTelegramUsername(sender.username)
+          : null;
+    } catch (error) {
+      if (isTelegramEntityResolveError(error)) {
+        console.warn("telegram entity resolve failed; message skipped", {
+          source,
+          chat_id: chatId,
+          message_id: message.id.toString(),
+          sender_id: senderTelegramId,
+          error: getErrorMessage(error),
+        });
+        markTelegramMessageProcessed(storedMessage.id, null);
+        return "ignored";
+      }
+
+      throw error;
+    }
+  }
 
   if (!student && senderUsername) {
     student = findStudentByTelegramUsername(senderUsername);
@@ -1271,6 +1395,7 @@ async function processTelegramMessageUnlocked(
 
     try {
       const action = await handlePdfReceipt(
+        client,
         message,
         student,
         document,
@@ -1362,9 +1487,11 @@ async function processTelegramMessageUnlocked(
       `
     ).run(text, lesson.id);
 
-    await message.respond({
-      message: "Спасибо, я получил причину. Я посмотрю и отвечу вручную.",
-    });
+    await safelySendStudentMessage(
+      client,
+      student,
+      "Спасибо, я получил причину. Я посмотрю и отвечу вручную."
+    );
     console.log("message saved as cancellation reason", {
       lessonId: lesson.id,
       studentId: student.id,
@@ -1407,9 +1534,11 @@ async function processTelegramMessageUnlocked(
     }
 
     if (intent === "unknown") {
-      await message.respond({
-        message: studentReplyClarificationMessage,
-      });
+      await safelySendStudentMessage(
+        client,
+        student,
+        studentReplyClarificationMessage
+      );
       console.log("unknown reminder reply sent", {
         studentId: student.id,
         lessonId: lesson.id,
@@ -1450,10 +1579,11 @@ async function processTelegramMessageUnlocked(
     }
 
     if (isLessonCancelledStatus(lesson.status)) {
-      await message.respond({
-        message:
-          "Урок уже отмечен как отменённый. Если нужно восстановить урок, напиши преподавателю напрямую.",
-      });
+      await safelySendStudentMessage(
+        client,
+        student,
+        "Урок уже отмечен как отменённый. Если нужно восстановить урок, напиши преподавателю напрямую."
+      );
 
       console.log(`Cancelled lesson ${lesson.id} kept unchanged after ready reply`);
       markTelegramMessageProcessed(storedMessage.id, student.id);
@@ -1472,9 +1602,11 @@ async function processTelegramMessageUnlocked(
       `
     ).run(lesson.id);
 
-    await message.respond({
-      message: "Отлично, до встречи на уроке ✅",
-    });
+    await safelySendStudentMessage(
+      client,
+      student,
+      "Отлично, до встречи на уроке ✅"
+    );
 
     console.log(`Lesson ${lesson.id} confirmed`);
     const payment = db
@@ -1513,11 +1645,13 @@ async function processTelegramMessageUnlocked(
       `
     ).run(cancellationReason ? 0 : 1, cancellationReason, lesson.id);
 
-    await message.respond({
-      message: cancellationReason
+    await safelySendStudentMessage(
+      client,
+      student,
+      cancellationReason
         ? "Спасибо, я получил причину. Я посмотрю и отвечу вручную."
-        : "К сожалению, я не могу автоматически отменить урок менее чем за 10 часов до начала.\n\nНапиши, пожалуйста, причину здесь — я посмотрю и отвечу вручную.",
-    });
+        : "К сожалению, я не могу автоматически отменить урок менее чем за 10 часов до начала.\n\nНапиши, пожалуйста, причину здесь — я посмотрю и отвечу вручную."
+    );
 
     console.log("Cancellation blocked because less than 10 hours remain", {
       lessonId: lesson.id,
@@ -1543,9 +1677,11 @@ async function processTelegramMessageUnlocked(
     `
   ).run(lesson.id);
 
-  await message.respond({
-    message: "Понял, отмену урока зафиксировал.",
-  });
+  await safelySendStudentMessage(
+    client,
+    student,
+    "Понял, отмену урока зафиксировал."
+  );
 
   console.log("message parsed as cancellation request; lesson cancelled", {
     lessonId: lesson.id,
@@ -1755,28 +1891,57 @@ export async function startTelegramListener(): Promise<void> {
           }>;
 
           for (const student of students) {
-            const target =
-              student.telegram_id?.trim() ||
-              student.telegram_username?.trim().replace(/^@/, "");
+            const targets = [student.telegram_id, student.telegram_username];
+            const target = await safeResolveInputEntity(client, targets);
 
             if (!target) {
               continue;
             }
 
-            const messages = await client.getMessages(target, {
-              limit: pollingLimit,
-            });
+            let messages: Awaited<ReturnType<TelegramClient["getMessages"]>>;
+
+            try {
+              messages = await client.getMessages(target, {
+                limit: pollingLimit,
+              });
+            } catch (error) {
+              const errorMessage = getErrorMessage(error);
+
+              if (isTelegramEntityResolveError(error)) {
+                console.warn("telegram entity resolve failed; message skipped", {
+                  telegramId: student.telegram_id,
+                  telegramUsername: student.telegram_username,
+                  error: errorMessage,
+                });
+              } else {
+                console.warn("telegram polling target failed; target skipped", {
+                  telegramId: student.telegram_id,
+                  telegramUsername: student.telegram_username,
+                  error: errorMessage,
+                });
+              }
+              continue;
+            }
 
             for (const message of [...messages].reverse()) {
-              const action = await safelyProcessTelegramMessage(
-                client,
-                message,
-                "polling"
-              );
-              if (action === "duplicate") {
-                skippedDuplicateCount += 1;
-              } else {
-                processedMessageCount += 1;
+              try {
+                const action = await safelyProcessTelegramMessage(
+                  client,
+                  message,
+                  "polling"
+                );
+                if (action === "duplicate") {
+                  skippedDuplicateCount += 1;
+                } else {
+                  processedMessageCount += 1;
+                }
+              } catch (error) {
+                console.warn("telegram polling message failed; message skipped", {
+                  telegramId: student.telegram_id,
+                  telegramUsername: student.telegram_username,
+                  messageId: message.id.toString(),
+                  error: getErrorMessage(error),
+                });
               }
             }
           }

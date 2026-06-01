@@ -12,7 +12,7 @@ process.env.TG_API_ID = "1";
 process.env.TG_API_HASH = "test-hash";
 process.env.TG_PHONE = "+10000000000";
 
-const { classifyStudentTextForLesson } = await import(
+const { classifyStudentTextForLesson, safeResolveInputEntity } = await import(
   "../services/telegramListener"
 );
 
@@ -98,6 +98,47 @@ assert.equal(classifyStudentTextForLesson(pendingLesson, "я готов").intent
 assert.notEqual(
   classifyStudentTextForLesson(pendingLesson, "я готов").intent,
   "completed"
+);
+
+let dialogsRefreshes = 0;
+const unresolvedClient = {
+  async getInputEntity() {
+    throw new Error(
+      'Could not find the input entity for {"userId":"1509372220","className":"PeerUser"}.'
+    );
+  },
+  async getDialogs() {
+    dialogsRefreshes += 1;
+    return [];
+  },
+};
+
+assert.equal(
+  await safeResolveInputEntity(
+    unresolvedClient as Parameters<typeof safeResolveInputEntity>[0],
+    ["1509372220"]
+  ),
+  null
+);
+assert.equal(dialogsRefreshes, 1);
+
+const resolvedEntity = { className: "InputPeerUser" };
+const resolvedClient = {
+  async getInputEntity(target: string) {
+    assert.equal(target, "10001");
+    return resolvedEntity;
+  },
+  async getDialogs() {
+    throw new Error("should not refresh dialogs for cached entity");
+  },
+};
+
+assert.equal(
+  await safeResolveInputEntity(
+    resolvedClient as unknown as Parameters<typeof safeResolveInputEntity>[0],
+    ["10001"]
+  ),
+  resolvedEntity
 );
 
 console.log("student message handling tests passed");
