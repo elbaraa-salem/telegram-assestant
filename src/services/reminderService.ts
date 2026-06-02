@@ -10,16 +10,24 @@ type ReminderLesson = {
   lesson_id: number;
   student_id: number;
   start_time: string;
+  status: string;
+  reminder_sent: number;
   name_ru: string;
+  is_active: number;
   telegram_username: string | null;
   telegram_id: string | null;
 };
 
 type ReminderResult = {
   scannedLessons: number;
-  remindersToSend: number;
+  eligibleLessons: number;
   sentReminders: number;
-  skippedLessons: number;
+  failedToSend: number;
+  skippedAlreadyReminded: number;
+  skippedNoTelegramTarget: number;
+  skippedOutsideWindow: number;
+  skippedStatus: number;
+  skippedPastLessons: number;
   dryRun: boolean;
 };
 
@@ -40,17 +48,21 @@ function cleanUsername(username: string): string {
   return username.trim().replace(/^@/, "");
 }
 
-function getReminderTarget(lesson: ReminderLesson): string | null {
-  if (lesson.telegram_id?.trim()) {
-    return lesson.telegram_id.trim();
-  }
-
+function getReminderTargets(lesson: ReminderLesson): string[] {
+  const targets: string[] = [];
   if (lesson.telegram_username?.trim()) {
-    return cleanUsername(lesson.telegram_username);
+    targets.push(cleanUsername(lesson.telegram_username));
   }
 
-  // This project does not yet have a safe id-to-entity resolution path.
-  return null;
+  if (lesson.telegram_id?.trim()) {
+    targets.push(lesson.telegram_id.trim());
+  }
+
+  return targets;
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function formatLessonDate(startTime: string): {
@@ -122,51 +134,61 @@ export async function sendLessonReminders(): Promise<ReminderResult> {
           lessons.id AS lesson_id,
           students.id AS student_id,
           lessons.start_time,
+          lessons.status,
+          lessons.reminder_sent,
           students.name_ru,
+          students.is_active,
           students.telegram_username,
           students.telegram_id
         FROM lessons
         JOIN students ON students.id = lessons.student_id
-        WHERE lessons.status = 'scheduled'
-          AND lessons.reminder_sent = 0
       `
     )
     .all() as ReminderLesson[];
 
+  const result: ReminderResult = {
+    scannedLessons: lessons.length,
+    eligibleLessons: 0,
+    sentReminders: 0,
+    failedToSend: 0,
+    skippedAlreadyReminded: 0,
+    skippedNoTelegramTarget: 0,
+    skippedOutsideWindow: 0,
+    skippedStatus: 0,
+    skippedPastLessons: 0,
+    dryRun,
+  };
   const lessonsToSend: ReminderLesson[] = [];
-  let skippedLessons = 0;
 
   for (const lesson of lessons) {
     const startTime = Date.parse(lesson.start_time);
 
-    if (
-      Number.isNaN(startTime) ||
-      startTime <= now ||
-      startTime > lookaheadUntil ||
-      !getReminderTarget(lesson)
+    if (lesson.status !== "scheduled") {
+      result.skippedStatus += 1;
+    } else if (lesson.reminder_sent !== 0) {
+      result.skippedAlreadyReminded += 1;
+    } else if (Number.isNaN(startTime) || startTime <= now) {
+      result.skippedPastLessons += 1;
+    } else if (startTime > lookaheadUntil) {
+      result.skippedOutsideWindow += 1;
+    } else if (
+      lesson.is_active !== 1 ||
+      getReminderTargets(lesson).length === 0
     ) {
-      skippedLessons += 1;
-      continue;
+      result.skippedNoTelegramTarget += 1;
+    } else {
+      result.eligibleLessons += 1;
+      lessonsToSend.push(lesson);
     }
-
-    lessonsToSend.push(lesson);
   }
-
-  const result: ReminderResult = {
-    scannedLessons: lessons.length,
-    remindersToSend: lessonsToSend.length,
-    sentReminders: 0,
-    skippedLessons,
-    dryRun,
-  };
 
   if (dryRun) {
     for (const lesson of lessonsToSend) {
-      const target = getReminderTarget(lesson);
+      const targets = getReminderTargets(lesson);
       console.log("Dry run reminder:");
       console.log({
         lessonId: lesson.lesson_id,
-        target,
+        targets,
         message: buildReminderMessage(lesson),
       });
     }
@@ -189,19 +211,53 @@ export async function sendLessonReminders(): Promise<ReminderResult> {
 
   try {
     for (const lesson of lessonsToSend) {
-      const target = getReminderTarget(lesson);
+      try {
+        const targets = getReminderTargets(lesson);
+        let sent = false;
+        let lastError: unknown = null;
 
-      if (!target) {
-        result.skippedLessons += 1;
-        continue;
+        for (const target of targets) {
+          try {
+            await client.sendMessage(target, {
+              message: buildReminderMessage(lesson),
+            });
+            sent = true;
+            break;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+
+        if (!sent) {
+          result.failedToSend += 1;
+          console.warn("Reminder send failed for student; continuing", {
+            studentId: lesson.student_id,
+            studentNameRu: lesson.name_ru,
+            telegramUsername: lesson.telegram_username,
+            telegramId: lesson.telegram_id,
+            lessonId: lesson.lesson_id,
+            lessonStartTime: lesson.start_time,
+            errorMessage: lastError
+              ? getErrorMessage(lastError)
+              : "No Telegram target available",
+          });
+          continue;
+        }
+
+        updateReminderSent.run(lesson.lesson_id);
+        result.sentReminders += 1;
+      } catch (error) {
+        result.failedToSend += 1;
+        console.warn("Reminder send failed for student; continuing", {
+          studentId: lesson.student_id,
+          studentNameRu: lesson.name_ru,
+          telegramUsername: lesson.telegram_username,
+          telegramId: lesson.telegram_id,
+          lessonId: lesson.lesson_id,
+          lessonStartTime: lesson.start_time,
+          errorMessage: getErrorMessage(error),
+        });
       }
-
-      await client.sendMessage(target, {
-        message: buildReminderMessage(lesson),
-      });
-
-      updateReminderSent.run(lesson.lesson_id);
-      result.sentReminders += 1;
     }
   } finally {
     await client.disconnect();
