@@ -545,6 +545,8 @@ export async function syncCalendarLessons(
       UPDATE lessons
       SET google_status = 'deleted',
           google_deleted_at = COALESCE(google_deleted_at, datetime('now')),
+          status = 'cancelled',
+          cancellation_source = COALESCE(cancellation_source, 'teacher'),
           updated_at = datetime('now')
       WHERE id = ?
     `

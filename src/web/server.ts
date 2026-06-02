@@ -48,6 +48,7 @@ type LessonRow = {
   name_ru: string | null;
   start_time: string;
   status: string;
+  google_deleted_at: string | null;
   student_response: string | null;
   cancellation_source: string | null;
   awaiting_cancellation_reason: number;
@@ -80,6 +81,7 @@ type LessonCancelRow = {
   name_ru: string | null;
   start_time: string;
   status: string;
+  google_deleted_at: string | null;
   student_response: string | null;
   cancellation_source: string | null;
   awaiting_cancellation_reason: number;
@@ -138,6 +140,7 @@ function getCancelLesson(lessonId: number): LessonCancelRow | undefined {
           students.name_ru,
           lessons.start_time,
           lessons.status,
+          lessons.google_deleted_at,
           lessons.student_response,
           lessons.cancellation_source,
           lessons.awaiting_cancellation_reason,
@@ -827,6 +830,7 @@ app.get("/lessons", (request, response) => {
           students.name_ru,
           lessons.start_time,
           lessons.status,
+          lessons.google_deleted_at,
           lessons.student_response,
           lessons.cancellation_source,
           lessons.awaiting_cancellation_reason,
@@ -874,6 +878,10 @@ app.get("/lessons", (request, response) => {
 
   const viewLessons = lessons.map((lesson) => ({
     ...lesson,
+    displayStatus: lesson.google_deleted_at
+      ? "deleted from Google Calendar"
+      : lesson.status,
+    isGoogleDeleted: Boolean(lesson.google_deleted_at),
     formattedStartTime: formatLessonStartTime(lesson.start_time),
     packageProgress:
       lesson.payment_method === "package" &&
@@ -882,9 +890,12 @@ app.get("/lessons", (request, response) => {
         ? `${lesson.package_used_lessons} / ${lesson.package_total_lessons}`
         : "",
     hasCancellationRequest: buildCancellationRequested(lesson),
-    canCancel: isCancellableLessonStatus(lesson.status),
-    canComplete: isCancellableLessonStatus(lesson.status),
+    canCancel:
+      !lesson.google_deleted_at && isCancellableLessonStatus(lesson.status),
+    canComplete:
+      !lesson.google_deleted_at && isCancellableLessonStatus(lesson.status),
     canConfirmPayment:
+      !lesson.google_deleted_at &&
       !isCancelledLessonStatus(lesson.status) &&
       ["unpaid", "partial"].includes(lesson.payment_status ?? ""),
     aiReceipt: buildAiReceipt(lesson),
@@ -922,6 +933,15 @@ app.get("/lessons/:id/cancel", (request, response) => {
       title: "Lesson already completed",
       page: "error",
       message: "Completed lessons cannot be cancelled.",
+    });
+    return;
+  }
+
+  if (lesson.google_deleted_at) {
+    response.status(400).render("layout", {
+      title: "Lesson deleted from Google Calendar",
+      page: "error",
+      message: "Deleted Google Calendar lessons cannot be cancelled here.",
     });
     return;
   }
@@ -978,6 +998,11 @@ app.post("/lessons/:id/cancel", (request, response) => {
       page: "error",
       message: "Completed lessons cannot be cancelled.",
     });
+    return;
+  }
+
+  if (lesson.google_deleted_at) {
+    response.redirect("/lessons");
     return;
   }
 

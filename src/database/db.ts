@@ -476,6 +476,19 @@ function backfillReminderSentAtForScheduledFutureLessons(): void {
   }
 }
 
+export function repairGoogleDeletedScheduledLessons(): void {
+  db.prepare(
+    `
+      UPDATE lessons
+      SET status = 'cancelled',
+          cancellation_source = COALESCE(cancellation_source, 'teacher'),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE google_deleted_at IS NOT NULL
+        AND status = 'scheduled'
+    `
+  ).run();
+}
+
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response TEXT");
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response_at TEXT");
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN reminder_sent_at TEXT");
@@ -492,6 +505,7 @@ addColumnIfMissing(
   "ALTER TABLE lessons ADD COLUMN cancellation_confirmed_by TEXT DEFAULT 'admin'"
 );
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN google_deleted_at TEXT");
+repairGoogleDeletedScheduledLessons();
 backfillReminderSentAtForScheduledFutureLessons();
 addColumnIfMissing(
   "ALTER TABLE students ADD COLUMN lesson_price_amount INTEGER NOT NULL DEFAULT 0"

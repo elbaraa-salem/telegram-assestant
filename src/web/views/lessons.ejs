@@ -45,7 +45,12 @@
           <%= lesson.formattedStartTime.date %><br>
           <%= lesson.formattedStartTime.time %>
         </td>
-        <td><%= lesson.status %></td>
+        <td>
+          <%= lesson.displayStatus %>
+          <% if (lesson.isGoogleDeleted) { %>
+            <br><span class="help-text">Deleted from Google Calendar</span>
+          <% } %>
+        </td>
         <td><%= lesson.student_response %></td>
         <td>
           <% if (lesson.cancellation_source) { %>

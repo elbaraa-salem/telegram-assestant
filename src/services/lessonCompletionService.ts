@@ -16,6 +16,7 @@ const protectedStatuses = new Set([
 type CompletionRow = {
   lesson_id: number;
   lesson_status: string;
+  google_deleted_at: string | null;
   student_id: number;
   telegram_username: string | null;
 };
@@ -102,6 +103,7 @@ export async function completeLesson(lessonId: number): Promise<boolean> {
         SELECT
           lessons.id AS lesson_id,
           lessons.status AS lesson_status,
+          lessons.google_deleted_at,
           students.id AS student_id,
           students.telegram_username
         FROM lessons
@@ -114,6 +116,7 @@ export async function completeLesson(lessonId: number): Promise<boolean> {
   if (
     !lesson ||
     lesson.lesson_status === "completed" ||
+    lesson.google_deleted_at ||
     protectedStatuses.has(lesson.lesson_status)
   ) {
     return false;

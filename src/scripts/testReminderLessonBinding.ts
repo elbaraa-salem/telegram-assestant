@@ -13,7 +13,7 @@ process.env.TG_API_HASH = "test-hash";
 process.env.TG_PHONE = "+10000000000";
 process.env.REMINDER_LOOKAHEAD_HOURS = "24";
 
-const { db } = await import("../database/db");
+const { db, repairGoogleDeletedScheduledLessons } = await import("../database/db");
 const { sendLessonReminders } = await import("../services/reminderService");
 const { findActiveScheduledRemindedLesson } = await import(
   "../services/telegramListener"
@@ -267,6 +267,41 @@ assert.equal(
   findActiveScheduledRemindedLesson(googleDeletedReplyStudentId)?.id,
   replyActiveLessonId,
   "google-deleted reminded lessons should not block active scheduled lessons"
+);
+
+const inconsistentLessonId = insertLesson(googleDeletedReplyStudentId, {
+  status: "scheduled",
+  reminder_sent: 1,
+  reminder_sent_at: new Date(now - 6 * 60 * 1000).toISOString(),
+  google_deleted_at: new Date(now - 5 * 60 * 1000).toISOString(),
+  start_time: toHourOnlyPlusSeven(new Date(now + 2 * 60 * 60 * 1000)),
+});
+repairGoogleDeletedScheduledLessons();
+const repairedLesson = db
+  .prepare("SELECT status, cancellation_source FROM lessons WHERE id = ?")
+  .get(inconsistentLessonId) as {
+  status: string;
+  cancellation_source: string | null;
+};
+assert.equal(repairedLesson.status, "cancelled");
+assert.equal(repairedLesson.cancellation_source, "teacher");
+
+const deletedOnlyStudentId = insertStudent({
+  telegram_username: "@deleted_only",
+  telegram_id: "70007",
+  calendar_keyword: "deleted-only-student",
+});
+insertLesson(deletedOnlyStudentId, {
+  status: "scheduled",
+  reminder_sent: 1,
+  reminder_sent_at: new Date(now - 10 * 60 * 1000).toISOString(),
+  google_deleted_at: new Date(now - 5 * 60 * 1000).toISOString(),
+  start_time: toHourOnlyPlusSeven(new Date(now + 60 * 60 * 1000)),
+});
+assert.equal(
+  findActiveScheduledRemindedLesson(deletedOnlyStudentId),
+  null,
+  "reply to an old reminder after Google deletion should not select a lesson"
 );
 
 const deletedStudentId = insertStudent({

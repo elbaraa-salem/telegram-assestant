@@ -105,6 +105,7 @@ function insertLesson(input: {
   eventId: string;
   studentId?: number;
   status?: string;
+  googleDeletedAt?: string | null;
   cancellationReason?: string | null;
   cancellationRequestedAt?: string | null;
   startModifier?: string;
@@ -120,11 +121,12 @@ function insertLesson(input: {
             start_time,
             end_time,
             status,
+            google_deleted_at,
             cancellation_reason,
             cancellation_requested_at,
             updated_at
           )
-          VALUES (?, ?, 'Cancellation workflow lesson', datetime('now', ?), datetime('now', ?, '+1 hour'), ?, ?, ?, datetime('now'))
+          VALUES (?, ?, 'Cancellation workflow lesson', datetime('now', ?), datetime('now', ?, '+1 hour'), ?, ?, ?, ?, datetime('now'))
         `
       )
       .run(
@@ -133,6 +135,7 @@ function insertLesson(input: {
         input.startModifier ?? "+1 day",
         input.startModifier ?? "+1 day",
         input.status ?? "scheduled",
+        input.googleDeletedAt ?? null,
         input.cancellationReason ?? null,
         input.cancellationRequestedAt ?? null
       ).lastInsertRowid
@@ -166,6 +169,12 @@ const completedVisibleLessonId = insertLesson({
 const cancelledVisibleLessonId = insertLesson({
   eventId: "cancelled-visible-test",
   status: "cancelled",
+  startModifier: "+1 day",
+});
+const googleDeletedVisibleLessonId = insertLesson({
+  eventId: "google-deleted-visible-test",
+  status: "scheduled",
+  googleDeletedAt: new Date().toISOString(),
   startModifier: "+1 day",
 });
 
@@ -324,6 +333,21 @@ try {
     lessonsHtml,
     new RegExp(`<td>${cancelledVisibleLessonId}</td>`),
     "cancelled lessons inside range should be shown"
+  );
+  assert.match(
+    lessonsHtml,
+    new RegExp(`<td>${googleDeletedVisibleLessonId}</td>[\\s\\S]*Deleted from Google Calendar`),
+    "google-deleted lessons should be marked in admin"
+  );
+  assert.doesNotMatch(
+    lessonsHtml,
+    new RegExp(`/lessons/${googleDeletedVisibleLessonId}/complete`),
+    "google-deleted lessons should not show complete action"
+  );
+  assert.doesNotMatch(
+    lessonsHtml,
+    new RegExp(`/lessons/${googleDeletedVisibleLessonId}/cancel`),
+    "google-deleted lessons should not show cancel action"
   );
 
   const requestedCancelHtml = await (

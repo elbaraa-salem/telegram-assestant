@@ -291,6 +291,25 @@ try {
     );
   }
 
+  const remindedDeletedLesson = db
+    .prepare(
+      `
+        SELECT status, cancellation_source, google_deleted_at, reminder_sent
+        FROM lessons
+        WHERE id = ?
+      `
+    )
+    .get(remindedMissingLessonId) as {
+    status: string;
+    cancellation_source: string | null;
+    google_deleted_at: string | null;
+    reminder_sent: number;
+  };
+  assert.equal(remindedDeletedLesson.status, "cancelled");
+  assert.equal(remindedDeletedLesson.cancellation_source, "teacher");
+  assert.ok(remindedDeletedLesson.google_deleted_at);
+  assert.equal(remindedDeletedLesson.reminder_sent, 1);
+
   console.log("Production setup checks passed.");
 } finally {
   db.close();
