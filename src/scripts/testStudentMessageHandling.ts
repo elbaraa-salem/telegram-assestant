@@ -24,6 +24,7 @@ function lesson(overrides: Partial<TestLesson> = {}): TestLesson {
     start_time: "2026-06-02T10:00:00+07:00",
     status: "scheduled",
     reminder_sent: 1,
+    reminder_sent_at: "2026-06-01T10:00:00.000Z",
     student_response: null,
     awaiting_cancellation_reason: 0,
     cancellation_reason: null,

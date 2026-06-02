@@ -11,7 +11,10 @@ type ReminderLesson = {
   student_id: number;
   start_time: string;
   status: string;
+  google_status: string | null;
+  google_deleted_at: string | null;
   reminder_sent: number;
+  reminder_sent_at: string | null;
   name_ru: string;
   is_active: number;
   telegram_username: string | null;
@@ -29,6 +32,18 @@ type ReminderResult = {
   skippedStatus: number;
   skippedPastLessons: number;
   dryRun: boolean;
+};
+
+type ReminderTelegramClient = {
+  sendMessage(target: string, input: { message: string }): Promise<unknown>;
+  disconnect?(): Promise<void>;
+};
+
+type SendLessonReminderOptions = {
+  client?: ReminderTelegramClient;
+  dryRun?: boolean;
+  skipResolveMissingTelegramIds?: boolean;
+  now?: number;
 };
 
 function getPositiveNumberEnv(name: string, fallback: number): number {
@@ -65,6 +80,27 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function normalizeLessonTimestamp(startTime: string): string {
+  return startTime.replace(/([+-]\d{2})$/, "$1:00");
+}
+
+function parseLessonTimestamp(startTime: string): number {
+  return Date.parse(normalizeLessonTimestamp(startTime));
+}
+
+function getReminderMessageId(sentMessage: unknown): string | null {
+  if (
+    sentMessage &&
+    typeof sentMessage === "object" &&
+    "id" in sentMessage
+  ) {
+    const id = (sentMessage as { id?: unknown }).id;
+    return id === undefined || id === null ? null : String(id);
+  }
+
+  return null;
+}
+
 function formatLessonDate(startTime: string): {
   weekday: string;
   day: string;
@@ -72,7 +108,7 @@ function formatLessonDate(startTime: string): {
   time: string;
 } {
   const timeZone = process.env.APP_TIMEZONE ?? "Europe/Moscow";
-  const lessonDate = new Date(startTime);
+  const lessonDate = new Date(normalizeLessonTimestamp(startTime));
 
   return {
     weekday: new Intl.DateTimeFormat("ru-RU", {
@@ -117,13 +153,15 @@ function buildReminderMessage(lesson: ReminderLesson): string {
 Можно ответить цифрой или словами.${debtMessage}`;
 }
 
-export async function sendLessonReminders(): Promise<ReminderResult> {
-  const now = Date.now();
+export async function sendLessonReminders(
+  options: SendLessonReminderOptions = {}
+): Promise<ReminderResult> {
+  const now = options.now ?? Date.now();
   const lookaheadHours = getPositiveNumberEnv("REMINDER_LOOKAHEAD_HOURS", 24);
   const lookaheadUntil = now + lookaheadHours * 60 * 60 * 1000;
-  const dryRun = isDryRun();
+  const dryRun = options.dryRun ?? isDryRun();
 
-  if (!dryRun) {
+  if (!dryRun && !options.skipResolveMissingTelegramIds) {
     await resolveMissingTelegramIds();
   }
 
@@ -135,7 +173,10 @@ export async function sendLessonReminders(): Promise<ReminderResult> {
           students.id AS student_id,
           lessons.start_time,
           lessons.status,
+          lessons.google_status,
+          lessons.google_deleted_at,
           lessons.reminder_sent,
+          lessons.reminder_sent_at,
           students.name_ru,
           students.is_active,
           students.telegram_username,
@@ -161,21 +202,42 @@ export async function sendLessonReminders(): Promise<ReminderResult> {
   const lessonsToSend: ReminderLesson[] = [];
 
   for (const lesson of lessons) {
-    const startTime = Date.parse(lesson.start_time);
+    const startTime = parseLessonTimestamp(lesson.start_time);
+    const logReminderDecision = (action: "sent" | "skipped", skipReason: string | null) => {
+      console.log("Reminder lesson decision", {
+        lesson_id: lesson.lesson_id,
+        student_id: lesson.student_id,
+        start_time: lesson.start_time,
+        status: lesson.status,
+        action,
+        skip_reason: skipReason,
+      });
+    };
 
     if (lesson.status !== "scheduled") {
       result.skippedStatus += 1;
-    } else if (lesson.reminder_sent !== 0) {
+      logReminderDecision("skipped", "status_not_scheduled");
+    } else if (lesson.google_status === "deleted" || lesson.google_deleted_at) {
+      result.skippedStatus += 1;
+      logReminderDecision("skipped", "google_event_deleted");
+    } else if (lesson.reminder_sent !== 0 || lesson.reminder_sent_at) {
       result.skippedAlreadyReminded += 1;
+      logReminderDecision("skipped", "already_reminded");
     } else if (Number.isNaN(startTime) || startTime <= now) {
       result.skippedPastLessons += 1;
+      logReminderDecision("skipped", "past_lesson");
     } else if (startTime > lookaheadUntil) {
       result.skippedOutsideWindow += 1;
+      logReminderDecision("skipped", "outside_window");
     } else if (
       lesson.is_active !== 1 ||
       getReminderTargets(lesson).length === 0
     ) {
       result.skippedNoTelegramTarget += 1;
+      logReminderDecision(
+        "skipped",
+        lesson.is_active !== 1 ? "student_inactive" : "no_telegram_target"
+      );
     } else {
       result.eligibleLessons += 1;
       lessonsToSend.push(lesson);
@@ -200,14 +262,27 @@ export async function sendLessonReminders(): Promise<ReminderResult> {
     `
       UPDATE lessons
       SET reminder_sent = 1,
+          reminder_sent_at = datetime('now'),
+          reminder_message_id = ?,
+          reminder_error = NULL,
+          updated_at = datetime('now')
+      WHERE id = ?
+    `
+  );
+  const updateReminderError = db.prepare(
+    `
+      UPDATE lessons
+      SET reminder_error = ?,
           updated_at = datetime('now')
       WHERE id = ?
     `
   );
 
-  const client = await getTelegramClient("reminderService", {
-    sendOnly: true,
-  });
+  const client =
+    options.client ??
+    (await getTelegramClient("reminderService", {
+      sendOnly: true,
+    }));
 
   try {
     for (const lesson of lessonsToSend) {
@@ -218,9 +293,11 @@ export async function sendLessonReminders(): Promise<ReminderResult> {
 
         for (const target of targets) {
           try {
-            await client.sendMessage(target, {
+            const sentMessage = await client.sendMessage(target, {
               message: buildReminderMessage(lesson),
             });
+            const messageId = getReminderMessageId(sentMessage);
+            updateReminderSent.run(messageId, lesson.lesson_id);
             sent = true;
             break;
           } catch (error) {
@@ -230,6 +307,12 @@ export async function sendLessonReminders(): Promise<ReminderResult> {
 
         if (!sent) {
           result.failedToSend += 1;
+          updateReminderError.run(
+            lastError
+              ? getErrorMessage(lastError)
+              : "No Telegram target available",
+            lesson.lesson_id
+          );
           console.warn("Reminder send failed for student; continuing", {
             studentId: lesson.student_id,
             studentNameRu: lesson.name_ru,
@@ -244,10 +327,18 @@ export async function sendLessonReminders(): Promise<ReminderResult> {
           continue;
         }
 
-        updateReminderSent.run(lesson.lesson_id);
+        console.log("Reminder lesson decision", {
+          lesson_id: lesson.lesson_id,
+          student_id: lesson.student_id,
+          start_time: lesson.start_time,
+          status: lesson.status,
+          action: "sent",
+          skip_reason: null,
+        });
         result.sentReminders += 1;
       } catch (error) {
         result.failedToSend += 1;
+        updateReminderError.run(getErrorMessage(error), lesson.lesson_id);
         console.warn("Reminder send failed for student; continuing", {
           studentId: lesson.student_id,
           studentNameRu: lesson.name_ru,
@@ -260,10 +351,12 @@ export async function sendLessonReminders(): Promise<ReminderResult> {
       }
     }
   } finally {
-    await client.disconnect();
-    console.log("reminderService Telegram client disconnected", {
-      pid: process.pid,
-    });
+    if (client.disconnect) {
+      await client.disconnect();
+      console.log("reminderService Telegram client disconnected", {
+        pid: process.pid,
+      });
+    }
   }
 
   return result;

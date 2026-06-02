@@ -59,15 +59,23 @@ type Lesson = {
   start_time: string;
   status: string;
   reminder_sent: number;
+  reminder_sent_at: string | null;
   student_response: string | null;
   awaiting_cancellation_reason: number;
   cancellation_reason: string | null;
 };
 
-function findNearestRemindedLesson(studentId: number): Lesson | null {
-  const now = Date.now();
-  const recentCutoff = now - recentLessonWindowHours * 60 * 60 * 1000;
+function normalizeLessonTimestamp(startTime: string): string {
+  return startTime.replace(/([+-]\d{2})$/, "$1:00");
+}
 
+function parseLessonTimestamp(startTime: string): number {
+  return Date.parse(normalizeLessonTimestamp(startTime));
+}
+
+export function findActiveScheduledRemindedLesson(studentId: number): Lesson | null {
+  const now = Date.now();
+  const graceCutoff = now - recentLessonWindowHours * 60 * 60 * 1000;
   const lessons = db
     .prepare(
       `
@@ -76,40 +84,37 @@ function findNearestRemindedLesson(studentId: number): Lesson | null {
           start_time,
           status,
           reminder_sent,
+          reminder_sent_at,
           student_response,
           awaiting_cancellation_reason,
           cancellation_reason
         FROM lessons
         WHERE student_id = ?
-          AND reminder_sent = 1
-          AND status IN (
-            'scheduled',
-            'confirmed',
-            'ready',
-            'cancellation_requested',
-            'cancelled',
-            'cancelled_by_student',
-            'cancelled_by_teacher'
+          AND status = 'scheduled'
+          AND google_deleted_at IS NULL
+          AND COALESCE(google_status, '') != 'deleted'
+          AND (
+            reminder_sent_at IS NOT NULL
+            OR reminder_sent = 1
           )
+          AND student_response IS NULL
       `
     )
     .all(studentId) as Lesson[];
 
-  const activeLessons = lessons
-    .map((lesson) => ({
-      lesson,
-      startTimeMs: Date.parse(lesson.start_time),
-    }))
-    .filter(
-      ({ startTimeMs }) =>
-        !Number.isNaN(startTimeMs) && startTimeMs >= recentCutoff
-    )
-    .sort(
-      (left, right) =>
-        Math.abs(left.startTimeMs - now) - Math.abs(right.startTimeMs - now)
-    );
-
-  return activeLessons[0]?.lesson ?? null;
+  return (
+    lessons
+      .map((lesson) => ({
+        lesson,
+        startTimeMs: parseLessonTimestamp(lesson.start_time),
+      }))
+      .filter(
+        ({ startTimeMs }) =>
+          !Number.isNaN(startTimeMs) && startTimeMs > graceCutoff
+      )
+      .sort((left, right) => left.startTimeMs - right.startTimeMs)[0]
+      ?.lesson ?? null
+  );
 }
 
 function findStudentByTelegramId(telegramId: string): Student | undefined {
@@ -810,7 +815,7 @@ function parseReminderReplyIntent(
 
 function isAwaitingReminderResponse(lesson: Lesson): boolean {
   return (
-    lesson.reminder_sent === 1 &&
+    (lesson.reminder_sent === 1 || Boolean(lesson.reminder_sent_at)) &&
     lesson.awaiting_cancellation_reason !== 1 &&
     lesson.student_response === null &&
     !isLessonCancelledStatus(lesson.status) &&
@@ -1435,9 +1440,29 @@ async function processTelegramMessageUnlocked(
     }
   }
 
-  const lesson = findNearestRemindedLesson(student.id);
+  const text = message.message?.trim() ?? "";
+  const lesson = findActiveScheduledRemindedLesson(student.id);
 
   if (!lesson) {
+    const fallbackIntent = parseStudentReplyIntent(text);
+    console.log("Student reply lesson selection", {
+      sender_id: senderTelegramId,
+      student_id: student.id,
+      reply_text: text,
+      selected_lesson_id: null,
+      selected_lesson_start_time: null,
+      selected_lesson_status: null,
+      selection_reason: "no_active_scheduled_reminded_lesson",
+    });
+
+    if (fallbackIntent === "ready" || fallbackIntent === "cancel") {
+      await safelySendStudentMessage(
+        client,
+        student,
+        "Я получил ответ, но не нашёл активный урок для подтверждения. Напиши Бараа напрямую."
+      );
+    }
+
     console.log("message ignored as unrelated: no active reminded lesson", {
       studentId: student.id,
       messageType,
@@ -1446,7 +1471,16 @@ async function processTelegramMessageUnlocked(
     return "ignored";
   }
 
-  const text = message.message?.trim() ?? "";
+  console.log("Student reply lesson selection", {
+    sender_id: senderTelegramId,
+    student_id: student.id,
+    reply_text: text,
+    selected_lesson_id: lesson.id,
+    selected_lesson_start_time: lesson.start_time,
+    selected_lesson_status: lesson.status,
+    selection_reason: "active_scheduled_reminded_lesson",
+  });
+
   const classification = classifyStudentTextForLesson(lesson, text);
   let intent: StudentReplyIntent = classification.intent;
   const messageState = classification.state;

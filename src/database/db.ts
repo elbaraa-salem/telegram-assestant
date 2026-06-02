@@ -60,6 +60,9 @@ db.exec(`
     student_response_at TEXT,
 
     reminder_sent INTEGER NOT NULL DEFAULT 0,
+    reminder_sent_at TEXT,
+    reminder_message_id TEXT,
+    reminder_error TEXT,
     payment_request_sent INTEGER NOT NULL DEFAULT 0,
 
     cancellation_source TEXT,
@@ -424,8 +427,60 @@ function migrateLessonChargesTableIfNeeded(): void {
   `);
 }
 
+function normalizeLessonTimestamp(startTime: string): string {
+  return startTime.replace(/([+-]\d{2})$/, "$1:00");
+}
+
+function parseLessonTimestamp(startTime: string): number {
+  return Date.parse(normalizeLessonTimestamp(startTime));
+}
+
+function backfillReminderSentAtForScheduledFutureLessons(): void {
+  const lessons = db
+    .prepare(
+      `
+        SELECT id, start_time, updated_at
+        FROM lessons
+        WHERE status = 'scheduled'
+          AND reminder_sent = 1
+          AND reminder_sent_at IS NULL
+          AND google_deleted_at IS NULL
+      `
+    )
+    .all() as Array<{
+    id: number;
+    start_time: string;
+    updated_at: string | null;
+  }>;
+
+  const now = Date.now();
+  const updateReminderSentAt = db.prepare(
+    `
+      UPDATE lessons
+      SET reminder_sent_at = COALESCE(?, datetime('now')),
+          updated_at = datetime('now')
+      WHERE id = ?
+        AND status = 'scheduled'
+        AND reminder_sent = 1
+        AND reminder_sent_at IS NULL
+        AND google_deleted_at IS NULL
+    `
+  );
+
+  for (const lesson of lessons) {
+    const startTimeMs = parseLessonTimestamp(lesson.start_time);
+
+    if (!Number.isNaN(startTimeMs) && startTimeMs > now) {
+      updateReminderSentAt.run(lesson.updated_at, lesson.id);
+    }
+  }
+}
+
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response TEXT");
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response_at TEXT");
+addColumnIfMissing("ALTER TABLE lessons ADD COLUMN reminder_sent_at TEXT");
+addColumnIfMissing("ALTER TABLE lessons ADD COLUMN reminder_message_id TEXT");
+addColumnIfMissing("ALTER TABLE lessons ADD COLUMN reminder_error TEXT");
 addColumnIfMissing(
   "ALTER TABLE lessons ADD COLUMN awaiting_cancellation_reason INTEGER NOT NULL DEFAULT 0"
 );
@@ -437,6 +492,7 @@ addColumnIfMissing(
   "ALTER TABLE lessons ADD COLUMN cancellation_confirmed_by TEXT DEFAULT 'admin'"
 );
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN google_deleted_at TEXT");
+backfillReminderSentAtForScheduledFutureLessons();
 addColumnIfMissing(
   "ALTER TABLE students ADD COLUMN lesson_price_amount INTEGER NOT NULL DEFAULT 0"
 );

@@ -38,6 +38,7 @@
     "test:production-setup": "tsx src/scripts/testProductionSetup.ts",
     "test:student-welcome": "tsx src/scripts/testStudentWelcome.ts",
     "test:student-message-handling": "tsx src/scripts/testStudentMessageHandling.ts",
+    "test:reminder-binding": "tsx src/scripts/testReminderLessonBinding.ts",
     "test:receipt-cleanup": "tsx src/scripts/testCleanupReceipts.ts",
     "test:receipt-idempotency": "tsx src/scripts/testReceiptIdempotency.ts",
     "test:pdf-text": "tsx src/scripts/extractReceiptText.ts",
