@@ -1,7 +1,7 @@
 import "dotenv/config";
 import input from "input";
 import { TelegramClient } from "telegram";
-import { StringSession } from "telegram/sessions";
+import { StringSession } from "telegram/sessions/index.js";
 
 // Manual test script only. Do not import this from production services.
 

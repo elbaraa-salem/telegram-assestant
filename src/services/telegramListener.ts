@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { NewMessage, NewMessageEvent } from "telegram/events";
+import { NewMessage, NewMessageEvent } from "telegram/events/index.js";
 import { Api, TelegramClient } from "telegram";
 import { db } from "../database/db";
 import { getTelegramClient } from "./telegramClient";
@@ -24,6 +24,9 @@ const pollingIntervalMs = Number(
   process.env.TELEGRAM_LISTENER_POLL_INTERVAL_MS ?? 5_000
 );
 const pollingLimit = Number(process.env.TELEGRAM_LISTENER_POLL_LIMIT ?? 5);
+const pollingEnabled =
+  String(process.env.TELEGRAM_LISTENER_ENABLE_POLLING ?? "false").toLowerCase() ===
+  "true";
 const minimumStudentReplyAiConfidence = 0.75;
 const staleProcessingMessageMs = 5 * 60 * 1000;
 const studentReplyClarificationMessage =
@@ -1331,55 +1334,11 @@ async function processTelegramMessageUnlocked(
 
   refreshStoredMessageMedia(storedMessage.id, message, document);
 
-  let student = findStudentByTelegramId(senderTelegramId);
-  let senderUsername: string | null = null;
-
-  if (!student) {
-    try {
-      const sender = await message.getSender();
-      senderUsername =
-        sender instanceof Api.User && sender.username
-          ? normalizeTelegramUsername(sender.username)
-          : null;
-    } catch (error) {
-      if (isTelegramEntityResolveError(error)) {
-        console.warn("telegram entity resolve failed; message skipped", {
-          source,
-          chat_id: chatId,
-          message_id: message.id.toString(),
-          sender_id: senderTelegramId,
-          error: getErrorMessage(error),
-        });
-        markTelegramMessageProcessed(storedMessage.id, null);
-        return "ignored";
-      }
-
-      throw error;
-    }
-  }
-
-  if (!student && senderUsername) {
-    student = findStudentByTelegramUsername(senderUsername);
-
-    if (student) {
-      db.prepare("UPDATE students SET telegram_id = ? WHERE id = ?").run(
-        senderTelegramId,
-        student.id
-      );
-      student.telegram_id = senderTelegramId;
-
-      console.log("Student telegram_id learned from incoming message", {
-        studentId: student.id,
-        username: senderUsername,
-        senderId: senderTelegramId,
-      });
-    }
-  }
+  const student = findStudentByTelegramId(senderTelegramId);
 
   if (!student) {
     console.log("No matching student", {
       senderId: senderTelegramId,
-      username: senderUsername,
     });
     markTelegramMessageProcessed(storedMessage.id, null);
     return "ignored";
@@ -1993,10 +1952,17 @@ export async function startTelegramListener(): Promise<void> {
         }
       };
 
-      await pollOnce();
-      activePollingTimer = setInterval(() => {
-        void pollOnce();
-      }, pollingIntervalMs);
+      if (pollingEnabled) {
+        await pollOnce();
+        activePollingTimer = setInterval(() => {
+          void pollOnce();
+        }, pollingIntervalMs);
+      } else {
+        console.log("telegramListener polling disabled", {
+          pid: process.pid,
+          generation,
+        });
+      }
       console.log("telegramListener ready to receive messages", {
         pid: process.pid,
         generation,

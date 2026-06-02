@@ -476,17 +476,33 @@ function backfillReminderSentAtForScheduledFutureLessons(): void {
   }
 }
 
-export function repairGoogleDeletedScheduledLessons(): void {
-  db.prepare(
-    `
-      UPDATE lessons
-      SET status = 'cancelled',
-          cancellation_source = COALESCE(cancellation_source, 'teacher'),
-          updated_at = CURRENT_TIMESTAMP
-      WHERE google_deleted_at IS NOT NULL
-        AND status = 'scheduled'
-    `
-  ).run();
+export function repairGoogleDeletedScheduledLessons(database = db): number {
+  console.log("google_deleted_at repair started");
+
+  try {
+    const activeDb = database ?? db;
+    const result = activeDb.prepare(
+      `
+        UPDATE lessons
+        SET status = 'cancelled',
+            cancellation_source = COALESCE(cancellation_source, 'teacher'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE google_deleted_at IS NOT NULL
+          AND status = 'scheduled'
+      `
+    ).run();
+
+    console.log("google_deleted_at repair completed", {
+      repairedRows: result.changes,
+    });
+    return result.changes;
+  } catch (error) {
+    console.error("google_deleted_at repair failed", {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    throw error;
+  }
 }
 
 addColumnIfMissing("ALTER TABLE lessons ADD COLUMN student_response TEXT");

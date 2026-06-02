@@ -11,7 +11,7 @@
     "send:reminders:prod": "APP_MODE=production ENABLE_TEST_SEED=false NODE_OPTIONS=--dns-result-order=ipv4first tsx src/services/reminderService.ts",
     "listen:telegram": "NODE_OPTIONS=--dns-result-order=ipv4first tsx src/services/telegramListener.ts",
     "build:css": "sass src/web/public/styles/main.scss src/web/public/styles/main.css",
-    "build:server": "tsc -p tsconfig.server.json",
+    "build:server": "tsc -p tsconfig.server.json && node scripts/fix-dist-esm-imports.mjs",
     "build:production": "npm run typecheck && npm run build:css && npm run build:server",
     "watch:css": "sass --watch src/web/public/styles/main.scss src/web/public/styles/main.css",
     "admin": "npm run start:web",

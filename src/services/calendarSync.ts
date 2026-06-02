@@ -1,7 +1,7 @@
 import "dotenv/config";
 import fs from "fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { pathToFileURL } from "node:url";
 import { google, calendar_v3 } from "googleapis";
 import { db } from "../database/db";
 
@@ -845,9 +845,10 @@ async function main() {
   }
 }
 
-const currentFilePath = fileURLToPath(import.meta.url);
-const executedFilePath = process.argv[1] ? path.resolve(process.argv[1]) : "";
+const isDirectRun =
+  Boolean(process.argv[1]) &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1]!)).href;
 
-if (currentFilePath === executedFilePath) {
+if (isDirectRun) {
   void main();
 }
