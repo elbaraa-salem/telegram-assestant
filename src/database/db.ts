@@ -106,6 +106,7 @@ db.exec(`
     ai_payment_date TEXT,
     ai_confidence REAL,
     ai_raw_result TEXT,
+    ai_parser_source TEXT,
 
     prepaid_package_id INTEGER,
     payment_method TEXT,
@@ -276,6 +277,7 @@ function migratePaymentsTableIfNeeded(): void {
       ai_payment_date TEXT,
       ai_confidence REAL,
       ai_raw_result TEXT,
+      ai_parser_source TEXT,
       receipt_fingerprint TEXT,
       receipt_document_number TEXT,
       receipt_operation_id TEXT,
@@ -309,6 +311,7 @@ function migratePaymentsTableIfNeeded(): void {
       ai_payment_date,
       ai_confidence,
       ai_raw_result,
+      ai_parser_source,
       receipt_fingerprint,
       receipt_document_number,
       receipt_operation_id,
@@ -339,6 +342,7 @@ function migratePaymentsTableIfNeeded(): void {
       ${selectColumn("ai_payment_date")},
       ${selectColumn("ai_confidence")},
       ${selectColumn("ai_raw_result")},
+      ${selectColumn("ai_parser_source")},
       ${selectColumn("receipt_fingerprint")},
       ${selectColumn("receipt_document_number")},
       ${selectColumn("receipt_operation_id")},
@@ -551,6 +555,7 @@ addPaymentColumnIfMissing("ai_currency", "ai_currency TEXT");
 addPaymentColumnIfMissing("ai_payment_date", "ai_payment_date TEXT");
 addPaymentColumnIfMissing("ai_confidence", "ai_confidence REAL");
 addPaymentColumnIfMissing("ai_raw_result", "ai_raw_result TEXT");
+addPaymentColumnIfMissing("ai_parser_source", "ai_parser_source TEXT");
 addPaymentColumnIfMissing("receipt_fingerprint", "receipt_fingerprint TEXT");
 addPaymentColumnIfMissing("receipt_document_number", "receipt_document_number TEXT");
 addPaymentColumnIfMissing("receipt_operation_id", "receipt_operation_id TEXT");

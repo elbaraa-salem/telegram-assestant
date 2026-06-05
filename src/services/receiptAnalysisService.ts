@@ -171,6 +171,7 @@ export async function analyzeAndSavePaymentReceipt(
           ai_payment_date = ?,
           ai_confidence = ?,
           ai_raw_result = ?,
+          ai_parser_source = 'ai',
           updated_at = datetime('now')
       WHERE id = ?
     `

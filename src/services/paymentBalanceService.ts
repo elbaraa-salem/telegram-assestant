@@ -68,7 +68,10 @@ export type CreateReceiptPaymentInput = {
   receiptFilePath: string;
   receiptText: string;
   aiResult: ReceiptAiResult;
+  parserSource?: "local" | "ai";
 };
+
+export type SaveReceiptForManualReviewInput = CreateReceiptPaymentInput;
 
 function normalizeAmount(value: number | null | undefined): number {
   return Number.isFinite(value) && value ? Math.max(0, Math.round(value)) : 0;
@@ -826,6 +829,7 @@ export function createReceiptPaymentAndApply(
             ai_payment_date,
             ai_confidence,
             ai_raw_result,
+            ai_parser_source,
             receipt_fingerprint,
             receipt_document_number,
             receipt_operation_id,
@@ -840,6 +844,7 @@ export function createReceiptPaymentAndApply(
             ?,
             datetime('now'),
             datetime('now'),
+            ?,
             ?,
             ?,
             ?,
@@ -870,6 +875,7 @@ export function createReceiptPaymentAndApply(
         input.aiResult.payment_date,
         input.aiResult.confidence,
         JSON.stringify(input.aiResult),
+        input.parserSource ?? "ai",
         receiptFingerprint,
         documentNumber,
         operationId
@@ -916,6 +922,103 @@ export function createReceiptPaymentAndApply(
   notifyManageSpendAfterCommit(result);
 
   return result;
+}
+
+export function saveReceiptPaymentForManualReview(
+  input: SaveReceiptForManualReviewInput
+): { paymentId: number; duplicate: boolean } {
+  return db.transaction(() => {
+    const existingPayment = db
+      .prepare(
+        `
+          SELECT id
+          FROM payments
+          WHERE telegram_message_id = ?
+        `
+      )
+      .get(input.telegramMessageId) as { id: number } | undefined;
+
+    if (existingPayment) {
+      markTelegramMessageProcessedIfNeeded(input.telegramMessageRowId, input.studentId);
+      return { paymentId: existingPayment.id, duplicate: true };
+    }
+
+    const amount = normalizeAmount(input.aiResult.amount);
+    const currency = normalizeReceiptCurrency(input.aiResult.currency);
+    const documentNumber = normalizeReceiptIdentityValue(input.aiResult.document_number);
+    const operationId = normalizeReceiptIdentityValue(input.aiResult.operation_id);
+
+    const insertResult = db
+      .prepare(
+        `
+          INSERT INTO payments (
+            lesson_id,
+            student_id,
+            status,
+            amount,
+            currency,
+            receipt_received_at,
+            telegram_message_id,
+            telegram_file_id,
+            receipt_file_path,
+            receipt_text,
+            ai_amount,
+            ai_currency,
+            ai_payment_date,
+            ai_confidence,
+            ai_raw_result,
+            ai_parser_source,
+            receipt_document_number,
+            receipt_operation_id,
+            payment_method,
+            updated_at
+          )
+          VALUES (
+            NULL,
+            ?,
+            'pending_manual_review',
+            ?,
+            ?,
+            datetime('now'),
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            'receipt',
+            datetime('now')
+          )
+        `
+      )
+      .run(
+        input.studentId,
+        amount > 0 ? amount : null,
+        currency,
+        input.telegramMessageId,
+        input.telegramFileId,
+        input.receiptFilePath,
+        input.receiptText,
+        input.aiResult.amount,
+        input.aiResult.currency,
+        input.aiResult.payment_date,
+        input.aiResult.confidence,
+        JSON.stringify(input.aiResult),
+        input.parserSource ?? "ai",
+        documentNumber,
+        operationId
+      );
+
+    markTelegramMessageProcessedIfNeeded(input.telegramMessageRowId, input.studentId);
+
+    return { paymentId: Number(insertResult.lastInsertRowid), duplicate: false };
+  })();
 }
 
 export function createManualPaymentAndApply(

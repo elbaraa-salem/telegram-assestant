@@ -11,8 +11,15 @@ import {
   extractTextFromPdf,
   ReceiptAiResult,
 } from "./receiptAnalysisService";
+import {
+  LocalReceiptParserResult,
+  parseLocalReceiptText,
+} from "./localReceiptParser";
 import { analyzeStudentReplyIntent } from "./studentReplyAiService";
-import { createReceiptPaymentAndApply } from "./paymentBalanceService";
+import {
+  createReceiptPaymentAndApply,
+  saveReceiptPaymentForManualReview,
+} from "./paymentBalanceService";
 
 const recentLessonWindowHours = 4;
 const cancellationDeadlineHours = Number(
@@ -55,6 +62,7 @@ type ReceiptTargetLesson = {
 type ClassifiedPdfReceipt = {
   extractedText: string;
   aiResult: ReceiptAiResult;
+  parserSource: "local" | "ai";
 };
 
 type Lesson = {
@@ -74,6 +82,41 @@ function normalizeLessonTimestamp(startTime: string): string {
 
 function parseLessonTimestamp(startTime: string): number {
   return Date.parse(normalizeLessonTimestamp(startTime));
+}
+
+function localReceiptResultToAiResult(
+  result: LocalReceiptParserResult
+): ReceiptAiResult {
+  return {
+    is_payment_receipt: result.isPaymentReceipt,
+    payment_confirmed:
+      result.status === "success" ? true : result.status === "failed" ? false : null,
+    amount: result.amount,
+    currency: result.currency,
+    payment_date: result.date,
+    document_number: null,
+    operation_id: null,
+    recipient: null,
+    sender: null,
+    confidence: result.confidence,
+    reason: result.reason,
+  };
+}
+
+function buildFailedAiReceiptResult(reason: string): ReceiptAiResult {
+  return {
+    is_payment_receipt: true,
+    payment_confirmed: null,
+    amount: null,
+    currency: null,
+    payment_date: null,
+    document_number: null,
+    operation_id: null,
+    recipient: null,
+    sender: null,
+    confidence: 0,
+    reason,
+  };
 }
 
 export function findActiveScheduledRemindedLesson(studentId: number): Lesson | null {
@@ -502,18 +545,109 @@ async function handlePdfReceipt(
       textLength: extractedText.length,
     });
 
-    console.log("AI receipt analysis started", {
+    const filename = getDocumentFilename(document);
+    console.log("local_receipt_parse_started", {
       studentId: student.id,
       messageId: message.id.toString(),
+      filename,
     });
-    const analysis: ClassifiedPdfReceipt = {
-      extractedText,
-      aiResult: await analyzeReceiptText(extractedText),
-    };
+
+    let localResult: LocalReceiptParserResult | null = null;
+    try {
+      localResult = parseLocalReceiptText(extractedText, filename ?? undefined);
+      console.log("local_receipt_parse_completed", {
+        studentId: student.id,
+        messageId: message.id.toString(),
+        isPaymentReceipt: localResult.isPaymentReceipt,
+        amount: localResult.amount,
+        currency: localResult.currency,
+        status: localResult.status,
+        confidence: localResult.confidence,
+        reason: localResult.reason,
+      });
+    } catch (error) {
+      console.error("local_receipt_parse_failed", {
+        studentId: student.id,
+        messageId: message.id.toString(),
+        error: getErrorMessage(error),
+      });
+    }
+
+    if (
+      localResult &&
+      localResult.isPaymentReceipt === false &&
+      localResult.confidence >= minimumReceiptConfidence
+    ) {
+      console.log("pdf ignored: local parser says not a payment receipt", {
+        studentId: student.id,
+        senderId: student.telegram_id,
+        messageId: message.id.toString(),
+        confidence: localResult.confidence,
+        reason: localResult.reason,
+      });
+      return "ignored";
+    }
+
+    let analysis: ClassifiedPdfReceipt | null = null;
+
+    if (
+      localResult &&
+      localResult.isPaymentReceipt === true &&
+      localResult.confidence >= minimumReceiptConfidence
+    ) {
+      console.log("ai_fallback_skipped_because_local_confident", {
+        studentId: student.id,
+        messageId: message.id.toString(),
+        confidence: localResult.confidence,
+      });
+      analysis = {
+        extractedText,
+        aiResult: localReceiptResultToAiResult(localResult),
+        parserSource: "local",
+      };
+    } else {
+      console.log("ai_fallback_started", {
+        studentId: student.id,
+        messageId: message.id.toString(),
+        localConfidence: localResult?.confidence ?? null,
+      });
+
+      try {
+        analysis = {
+          extractedText,
+          aiResult: await analyzeReceiptText(extractedText),
+          parserSource: "ai",
+        };
+      } catch (error) {
+        console.error("AI receipt analysis failed; saving for manual review", {
+          studentId: student.id,
+          messageId: message.id.toString(),
+          error: getErrorMessage(error),
+        });
+
+        saveReceiptPaymentForManualReview({
+          studentId: student.id,
+          telegramMessageRowId,
+          telegramMessageId: message.id.toString(),
+          telegramFileId: document.id.toString(),
+          receiptFilePath: receiptPath,
+          receiptText: extractedText,
+          aiResult: localResult
+            ? localReceiptResultToAiResult(localResult)
+            : buildFailedAiReceiptResult(
+                `AI receipt analysis failed: ${getErrorMessage(error)}`
+              ),
+          parserSource: localResult ? "local" : "ai",
+        });
+        return "saved_receipt";
+      }
+    }
+
     const result = analysis.aiResult;
     console.log("AI receipt analysis result", {
       studentId: student.id,
       messageId: message.id.toString(),
+      parserSource: analysis.parserSource,
       isPaymentReceipt: result.is_payment_receipt,
       paymentConfirmed: result.payment_confirmed,
       amount: result.amount,
@@ -525,11 +659,13 @@ async function handlePdfReceipt(
     const confidentReceipt =
       result.is_payment_receipt === true &&
       result.payment_confirmed === true &&
+      result.amount !== null &&
+      result.currency === "RUB" &&
       result.confidence !== null &&
       result.confidence >= minimumReceiptConfidence;
 
     if (!confidentReceipt) {
-      console.log("pdf ignored: not a receipt", {
+      console.log("receipt pending manual review", {
         studentId: student.id,
         senderId: student.telegram_id,
         messageId: message.id.toString(),
@@ -537,7 +673,17 @@ async function handlePdfReceipt(
         paymentConfirmed: result.payment_confirmed,
         confidence: result.confidence,
       });
-      return "ignored";
+      saveReceiptPaymentForManualReview({
+        studentId: student.id,
+        telegramMessageRowId,
+        telegramMessageId: message.id.toString(),
+        telegramFileId: document.id.toString(),
+        receiptFilePath: receiptPath,
+        receiptText: analysis.extractedText,
+        aiResult: result,
+        parserSource: analysis.parserSource,
+      });
+      return "saved_receipt";
     }
 
     console.log("Payment receipt detected", {
@@ -567,6 +713,7 @@ async function handlePdfReceipt(
       receiptFilePath: receiptPath,
       receiptText: analysis.extractedText,
       aiResult: result,
+      parserSource: analysis.parserSource,
     });
 
     if (application.conflict) {
