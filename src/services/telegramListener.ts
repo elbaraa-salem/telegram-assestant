@@ -15,7 +15,6 @@ import {
   LocalReceiptParserResult,
   parseLocalReceiptText,
 } from "./localReceiptParser";
-import { analyzeStudentReplyIntent } from "./studentReplyAiService";
 import {
   createReceiptPaymentAndApply,
   saveReceiptPaymentForManualReview,
@@ -34,10 +33,7 @@ const pollingLimit = Number(process.env.TELEGRAM_LISTENER_POLL_LIMIT ?? 5);
 const pollingEnabled =
   String(process.env.TELEGRAM_LISTENER_ENABLE_POLLING ?? "false").toLowerCase() ===
   "true";
-const minimumStudentReplyAiConfidence = 0.75;
 const staleProcessingMessageMs = 5 * 60 * 1000;
-const studentReplyClarificationMessage =
-  "Я не совсем понял ответ. Напиши, пожалуйста:\n1 — да, я готов\n2 — нет, нужно отменить";
 const activeTelegramMessageLocks = new Set<string>();
 
 type Student = {
@@ -143,7 +139,10 @@ export function findActiveScheduledRemindedLesson(studentId: number): Lesson | n
             reminder_sent_at IS NOT NULL
             OR reminder_sent = 1
           )
-          AND student_response IS NULL
+          AND (
+            student_response IS NULL
+            OR awaiting_cancellation_reason = 1
+          )
       `
     )
     .all(studentId) as Lesson[];
@@ -991,6 +990,14 @@ export function classifyStudentTextForLesson(
 ): StudentTextClassification {
   const state = getStudentMessageState(lesson);
 
+  if (state === "passive") {
+    return {
+      state,
+      intent: "unknown",
+      shouldSendUnknownReminderReply: false,
+    };
+  }
+
   if (state === "awaiting_cancellation_reason" && text.trim()) {
     const overrideIntent = parseExplicitCancellationReasonOverride(text);
 
@@ -1010,38 +1017,8 @@ export function classifyStudentTextForLesson(
   return {
     state,
     intent,
-    shouldSendUnknownReminderReply:
-      intent === "unknown" &&
-      state === "awaiting_reminder_response" &&
-      isProbablyUnclearReminderReply(text),
+    shouldSendUnknownReminderReply: false,
   };
-}
-
-function isProbablyUnclearReminderReply(text: string): boolean {
-  const normalized = normalizeReplyText(text);
-
-  if (!normalized) {
-    return false;
-  }
-
-  if (/^[12]?[+-]?$/.test(normalized)) {
-    return true;
-  }
-
-  if (normalized.length > 40) {
-    return false;
-  }
-
-  return (
-    normalized.includes("да") ||
-    normalized.includes("нет") ||
-    normalized.includes("готов") ||
-    normalized.includes("готова") ||
-    normalized.includes("могу") ||
-    normalized.includes("смогу") ||
-    normalized.includes("буду") ||
-    /\b(ok|okay|yes|no)\b/.test(normalized)
-  );
 }
 
 function extractCancellationReasonFromCancellationText(text: string): string | null {
@@ -1550,7 +1527,6 @@ async function processTelegramMessageUnlocked(
   const lesson = findActiveScheduledRemindedLesson(student.id);
 
   if (!lesson) {
-    const fallbackIntent = parseStudentReplyIntent(text);
     console.log("Student reply lesson selection", {
       sender_id: senderTelegramId,
       student_id: student.id,
@@ -1560,14 +1536,6 @@ async function processTelegramMessageUnlocked(
       selected_lesson_status: null,
       selection_reason: "no_active_scheduled_reminded_lesson",
     });
-
-    if (fallbackIntent === "ready" || fallbackIntent === "cancel") {
-      await safelySendStudentMessage(
-        client,
-        student,
-        "Я получил ответ, но не нашёл активный урок для подтверждения. Напиши Бараа напрямую."
-      );
-    }
 
     console.log("message ignored as unrelated: no active reminded lesson", {
       studentId: student.id,
@@ -1638,55 +1606,6 @@ async function processTelegramMessageUnlocked(
     });
     markTelegramMessageProcessed(storedMessage.id, student.id);
     return "cancellation_reason";
-  }
-
-  if (
-    intent === "unknown" &&
-    classification.shouldSendUnknownReminderReply
-  ) {
-    try {
-      const aiResult = await analyzeStudentReplyIntent({
-        text,
-        studentName: student.name_ru ?? student.name_ar ?? undefined,
-        lessonStartTime: lesson.start_time,
-      });
-
-      console.log("Student reply parsed by AI", {
-        studentId: student.id,
-        lessonId: lesson.id,
-        intent: aiResult.intent,
-        confidence: aiResult.confidence,
-        reason: aiResult.reason,
-      });
-
-      if (
-        aiResult.confidence >= minimumStudentReplyAiConfidence &&
-        (aiResult.intent === "ready" || aiResult.intent === "cancel")
-      ) {
-        intent = aiResult.intent;
-      }
-    } catch (error) {
-      console.error("Student reply AI parsing failed", {
-        studentId: student.id,
-        lessonId: lesson.id,
-        error: error instanceof Error ? error.message : "unknown error",
-      });
-    }
-
-    if (intent === "unknown") {
-      await safelySendStudentMessage(
-        client,
-        student,
-        studentReplyClarificationMessage
-      );
-      console.log("unknown reminder reply sent", {
-        studentId: student.id,
-        lessonId: lesson.id,
-        text,
-      });
-      markTelegramMessageProcessed(storedMessage.id, student.id);
-      return "ignored";
-    }
   }
 
   if (intent === "unknown") {
@@ -1831,7 +1750,7 @@ async function processTelegramMessageUnlocked(
   return "cancelled_lesson";
 }
 
-async function processTelegramMessage(
+export async function processTelegramMessage(
   client: TelegramClient,
   message: NewMessageEvent["message"],
   source: ProcessingSource
